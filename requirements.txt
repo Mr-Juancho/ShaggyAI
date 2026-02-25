@@ -1,0 +1,19 @@
+# Agente de IA Local - Dependencias completas (Fases 1 a 5)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+PyYAML>=6.0.1
+
+# Fase 2: Memoria (embeddings + ChromaDB)
+chromadb>=0.5.0
+numpy>=1.24.0
+
+# Fase 4: Telegram
+python-telegram-bot>=20.7,<22.0
+
+# Fase 5: Recordatorios + busqueda web
+apscheduler>=3.10.4
+dateparser>=1.2.0
+duckduckgo-search>=6.2.0

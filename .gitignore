@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Entorno virtual
+venv/
+.venv/
+env/
+
+# Variables de entorno (contiene tokens sensibles)
+.env
+.env.*
+!.env.example
+
+# Datos locales
+data/*
+!data/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Library/
+.pycache_local/
+
+# Logs
+*.log
+
+# Artefactos de ejecucion local
+runtime/
+*.command
+*.app

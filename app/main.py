@@ -1,0 +1,1098 @@
+"""
+Servidor principal FastAPI del agente de IA.
+Integra chat, memoria, Telegram, recordatorios y busqueda web.
+"""
+
+import asyncio
+import re
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta
+from typing import Any, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from app.config import FRONTEND_DIR, HOST, MAX_CONTEXT_MESSAGES, PORT, RELOAD, logger
+from app.llm_engine import OllamaEngine
+from app.system_prompt import build_system_prompt
+from app.utils import contains_datetime_reference, extract_search_intent, truncate_text
+
+try:
+    from app.memory import MemoryManager
+except Exception as exc:
+    MemoryManager = None  # type: ignore[assignment]
+    logger.error(f"No se pudo cargar MemoryManager: {exc}")
+
+try:
+    from app.reminders import ReminderManager
+except Exception as exc:
+    ReminderManager = None  # type: ignore[assignment]
+    logger.error(f"No se pudo cargar ReminderManager: {exc}")
+
+try:
+    from app.web_search import WebSearchEngine
+except Exception as exc:
+    WebSearchEngine = None  # type: ignore[assignment]
+    logger.error(f"No se pudo cargar WebSearchEngine: {exc}")
+
+try:
+    from app.telegram_bot import TelegramBot
+except Exception as exc:
+    TelegramBot = None  # type: ignore[assignment]
+    logger.error(f"No se pudo cargar TelegramBot: {exc}")
+
+
+# --- Modelos Pydantic ---
+class ChatRequest(BaseModel):
+    """Modelo de request para el endpoint /chat."""
+
+    message: str
+    user_id: str = "default"
+    source: str = "api"  # api, desktop, telegram, test
+
+
+class ChatResponse(BaseModel):
+    """Modelo de response para el endpoint /chat."""
+
+    response: str
+
+
+class RememberRequest(BaseModel):
+    """Modelo de request para /remember."""
+
+    info: str
+    user_id: str = "default"
+    metadata: Optional[dict[str, Any]] = None
+
+
+class RememberResponse(BaseModel):
+    """Modelo de response para /remember."""
+
+    stored: bool
+    message: str
+
+
+class ReminderCreateRequest(BaseModel):
+    """Modelo de request para POST /reminders."""
+
+    text: str = Field(..., min_length=3)
+    datetime: Optional[str] = None
+    recurring: bool = False
+    interval: Optional[str] = None
+
+
+class ReminderDeleteResponse(BaseModel):
+    """Modelo de response para DELETE /reminders/{id}."""
+
+    deleted: bool
+    message: str
+
+
+class RemindersResponse(BaseModel):
+    """Modelo de response para GET /reminders."""
+
+    reminders: list[dict[str, Any]]
+
+
+class HealthResponse(BaseModel):
+    """Modelo de response para el endpoint /health."""
+
+    status: str
+    ollama: bool
+
+
+# --- Estado global ---
+conversation_history: dict[str, list[dict[str, str]]] = {}
+pending_reminder_by_user: dict[str, dict[str, str]] = {}
+llm_engine = OllamaEngine()
+
+memory_manager = None
+if MemoryManager is not None:
+    try:
+        memory_manager = MemoryManager()
+    except Exception as exc:
+        logger.error(f"No se pudo inicializar MemoryManager: {exc}")
+
+reminder_manager = None
+if ReminderManager is not None:
+    try:
+        reminder_manager = ReminderManager()
+    except Exception as exc:
+        logger.error(f"No se pudo inicializar ReminderManager: {exc}")
+
+web_search_engine = None
+if WebSearchEngine is not None:
+    try:
+        web_search_engine = WebSearchEngine()
+    except Exception as exc:
+        logger.error(f"No se pudo inicializar WebSearchEngine: {exc}")
+
+telegram_bot = None
+telegram_task: Optional[asyncio.Task] = None
+
+REMINDER_REQUEST_RE = re.compile(
+    r"\b(recu[eé]rdame|recordarme|no\s+olvidar|av[ií]same|avisame)\b|"
+    r"\b(crea|crear|activa|activar|programa|programar|pon|poner|agenda|agendar)\b.{0,40}\b(recordatorio|aviso)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_DATETIME_HINT_RE = re.compile(
+    r"\b("
+    r"mañana|manana|pasado\s+mañana|hoy|esta\s+noche|"
+    r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[áa]bado|domingo|"
+    r"\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm)|"
+    r"a\s*las\s*\d{1,2}|en\s*\d+\s*(?:minutos?|horas?|d[ií]as?)|"
+    r"dentro\s*de\s*\d+\s*(?:minutos?|horas?|d[ií]as?)"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_FOLLOWUP_TASK_RE = re.compile(
+    r"^\s*(para\s+|ir\s+a\s+|tomar|hacer|comer|correr|leer|estudiar|comprar|"
+    r"pagar|llamar|enviar|revisar|terminar|empezar)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_PENDING_CANCEL_RE = re.compile(
+    r"\b(cancela|cancelar|olvida|olvidalo|olvídalo|ya\s+no|mejor\s+no)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_PENDING_TTL_MINUTES = 15
+# Detecta preguntas/quejas sobre recordatorios para NO confundirlas con crear uno.
+REMINDER_QUESTION_RE = re.compile(
+    r"\b(por\s*qu[eé]|porque|como\s+es\s+que|no\s+(?:activaste|funciono|funcionó|llego|llegó|sono|sonó|me\s+avisaste|se\s+activo|se\s+activó))\b"
+    r".{0,60}\b(recordatorio|recordatorios|aviso|avisos)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_LIST_RE = re.compile(
+    r"\b(cu[aá]les?|que|qu[eé])\s+(?:recordatorios?|pendientes)\s+(?:tengo|hay)\b|"
+    r"\b(?:listar|lista|ver|mostrar|muestrame|mu[eé]strame|consultar|consulta|ens[eé]ñame|dime)\b.{0,40}\b(recordatorios?|pendientes)\b|"
+    r"^\s*/reminders\s*$",
+    flags=re.IGNORECASE,
+)
+REMINDER_DELETE_RE = re.compile(
+    r"\b(elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|remueve|remover|completa|completar)\b"
+    r"(?:.{0,60}\b(recordatorio|recordatorios|pendiente|pendientes)\b|"
+    r"\s+[a-f0-9]{8}\b)",
+    flags=re.IGNORECASE,
+)
+REMINDER_DELETE_ALL_RE = re.compile(
+    r"\b(elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|completa|completar)\b"
+    r".{0,50}\b(todos|todas|todo)\b.{0,30}\b(recordatorios?|pendientes)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_ID_RE = re.compile(r"\b([a-f0-9]{8})\b", flags=re.IGNORECASE)
+REMINDER_DENIAL_RE = re.compile(
+    r"(no\s+puedo\s+(?:crear|activar|poner).{0,40}recordatorio|"
+    r"no\s+tengo\s+acceso.{0,40}recordatorio|"
+    r"no\s+puedo\s+crear\s+el\s+recordatorio\s+por\s+ti)",
+    flags=re.IGNORECASE,
+)
+WEB_INTENT_HINT_RE = re.compile(
+    r"\b(busca|buscar|investiga|consulta|averigua|web|internet|google|precio|cotizaci[oó]n|valor|noticias?|qu[ií]en|presidente|actual)\b",
+    flags=re.IGNORECASE,
+)
+TABLE_SEPARATOR_LINE_RE = re.compile(
+    r"^\|?\s*[:\-\u2013\u2014\u2500]{3,}(?:\s*\|\s*[:\-\u2013\u2014\u2500]{3,})+\s*\|?$"
+)
+HTML_TABLE_TAG_RE = re.compile(r"</?(table|thead|tbody|tr|th|td)\b", flags=re.IGNORECASE)
+GENERIC_REFUSAL_RE = re.compile(
+    r"^(lo\s+siento[, ]*)?(pero\s+)?no\s+puedo\s+ayudar\s+con\s+eso\.?\s*$",
+    flags=re.IGNORECASE,
+)
+BENIGN_OPINION_HINT_RE = re.compile(
+    r"\b(opini[oó]n|opinas|pel[ií]cula|pel[ií]culas|serie|series|libro|m[uú]sica|juego|recomienda|truman)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_web_query(text: str) -> str:
+    """Limpia una consulta para usarla en busqueda web."""
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"^(puedes|podrias|podr[ií]as|me\s+puedes|me\s+podr[ií]as)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^(buscar|busca|investigar|investiga|consultar|consulta)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip(" \t\n\r?¡!.,;:")
+
+
+def _remove_reminder_denials(text: str) -> str:
+    """Elimina frases donde el modelo niega poder crear recordatorios."""
+    lines = [line for line in text.splitlines() if not REMINDER_DENIAL_RE.search(line)]
+    cleaned = "\n".join(lines).strip()
+    if not cleaned:
+        return "Listo, ya programe tu recordatorio."
+    return cleaned
+
+
+def _get_pending_reminder(user_id: str) -> Optional[dict[str, str]]:
+    """Retorna recordatorio pendiente del usuario si no expiro."""
+    pending = pending_reminder_by_user.get(user_id)
+    if not pending:
+        return None
+
+    created_at = pending.get("created_at", "")
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+    except Exception:
+        pending_reminder_by_user.pop(user_id, None)
+        return None
+
+    if datetime.now() - created_dt > timedelta(minutes=REMINDER_PENDING_TTL_MINUTES):
+        pending_reminder_by_user.pop(user_id, None)
+        return None
+    return pending
+
+
+def _looks_like_reminder_creation_request(message: str) -> bool:
+    """Detecta peticiones de creacion de recordatorio, incluso sin verbo explicito."""
+    if REMINDER_REQUEST_RE.search(message):
+        return True
+
+    if REMINDER_QUESTION_RE.search(message) or REMINDER_LIST_RE.search(message):
+        return False
+    if REMINDER_DELETE_RE.search(message):
+        return False
+
+    lower = message.lower()
+    if re.search(r"\b(recordatorio|aviso)\b", lower) and REMINDER_DATETIME_HINT_RE.search(message):
+        return True
+    return False
+
+
+def _looks_like_reminder_task_followup(message: str) -> bool:
+    """
+    Detecta respuesta de seguimiento con la accion del recordatorio
+    (ej: 'para ir a correr').
+    """
+    cleaned = message.strip()
+    if not cleaned:
+        return False
+
+    if REMINDER_FOLLOWUP_TASK_RE.search(cleaned):
+        return True
+
+    # Mensajes cortos sin signos de pregunta suelen ser accion directa.
+    if (
+        "?" not in cleaned
+        and not _looks_like_reminder_creation_request(cleaned)
+        and len(cleaned.split()) <= 8
+    ):
+        return True
+    return False
+
+
+def _is_generic_refusal(text: str) -> bool:
+    """Detecta respuestas de rechazo generico que no ayudan al usuario."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if len(cleaned) > 140:
+        return False
+    return bool(GENERIC_REFUSAL_RE.match(cleaned))
+
+
+def _sanitize_memory_context(context: str) -> str:
+    """Quita frases de rechazo generico del contexto de memoria recuperado."""
+    if not context:
+        return ""
+
+    cleaned_lines: list[str] = []
+    for raw_line in context.splitlines():
+        line = raw_line.strip()
+        if not line:
+            cleaned_lines.append(raw_line)
+            continue
+        if _is_generic_refusal(line):
+            continue
+        if re.search(r"no\s+puedo\s+ayudar\s+con\s+eso", line, flags=re.IGNORECASE):
+            continue
+        if "no pude generar una respuesta" in line.lower():
+            continue
+        cleaned_lines.append(raw_line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def _sanitize_history_for_generation(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    """
+    Evita mandar al modelo respuestas de rechazo generico del asistente
+    para romper bucles de repeticion.
+    """
+    filtered: list[dict[str, str]] = []
+    for item in history:
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if role == "assistant" and _is_generic_refusal(content):
+            continue
+        filtered.append(item)
+    if len(filtered) > MAX_CONTEXT_MESSAGES:
+        return filtered[-MAX_CONTEXT_MESSAGES:]
+    return filtered
+
+
+def _normalize_response_format(text: str) -> str:
+    """
+    Normaliza respuestas malformadas (tablas con pipes rotos o HTML crudo)
+    para que sean legibles en web/Telegram.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return cleaned
+
+    cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("｜", "|")
+
+    if HTML_TABLE_TAG_RE.search(cleaned):
+        cleaned = re.sub(r"</?(table|thead|tbody)\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<tr\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</tr>", "\n", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<t[hd]\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</t[hd]>", " | ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", "", cleaned)
+
+    lines = cleaned.splitlines()
+
+    # Si ya es una tabla markdown valida, NO reescribirla.
+    for idx in range(len(lines) - 1):
+        header = lines[idx].strip().replace("｜", "|")
+        separator = lines[idx + 1].strip().replace("—", "-").replace("–", "-").replace("─", "-")
+        if "|" not in header:
+            continue
+        if not TABLE_SEPARATOR_LINE_RE.match(separator):
+            continue
+
+        header_cols = [segment.strip() for segment in header.strip("|").split("|") if segment.strip()]
+        if len(header_cols) < 2:
+            continue
+
+        row_count = 0
+        consistent_rows = 0
+        for row_line in lines[idx + 2 :]:
+            row = row_line.strip().replace("｜", "|")
+            if not row:
+                if row_count > 0:
+                    break
+                continue
+            if "|" not in row:
+                if row_count > 0:
+                    break
+                continue
+            row_count += 1
+            row_cols = [segment.strip() for segment in row.strip("|").split("|") if segment.strip()]
+            if len(row_cols) >= max(2, len(header_cols) - 1):
+                consistent_rows += 1
+        if row_count >= 2 and consistent_rows >= 2:
+            return cleaned
+
+    pipe_lines = [line for line in lines if "|" in line]
+    has_pipe_noise = len(pipe_lines) >= 3 and any(
+        "•" in line or line.strip().endswith("|") or line.strip().startswith("|")
+        for line in pipe_lines
+    )
+
+    if not has_pipe_noise:
+        return cleaned
+
+    rewritten_lines: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if rewritten_lines and rewritten_lines[-1]:
+                rewritten_lines.append("")
+            continue
+
+        line = re.sub(r"^>\s*", "", line)
+        line = re.sub(r"\s+\|\s*$", "", line)
+
+        normalized_sep = line.replace("—", "-").replace("–", "-").replace("─", "-")
+        if TABLE_SEPARATOR_LINE_RE.match(normalized_sep):
+            continue
+
+        if "|" in line and re.search(r"\bservicio\b", line, flags=re.IGNORECASE):
+            continue
+
+        row_match = re.match(
+            r"^\|?\s*\*{0,3}([^|*][^|]{1,80}?)\*{0,3}\s*\|\s*([^|]{1,220}?)(?:\s*\|.*)?$",
+            line,
+        )
+        if row_match and re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", row_match.group(1)):
+            service = re.sub(r"^\*+|\*+$", "", row_match.group(1)).strip(" :")
+            price = row_match.group(2).strip(" :")
+            is_valid_service = bool(
+                re.match(r"^[A-Za-zÁÉÍÓÚáéíóúÑñ][A-Za-zÁÉÍÓÚáéíóúÑñ0-9+ .,'/()\-]{1,80}$", service)
+            )
+            if is_valid_service and service.lower() not in {
+                "servicio",
+                "pros",
+                "contras",
+                "resumen",
+                "modelo",
+                "feature",
+            }:
+                if rewritten_lines and rewritten_lines[-1]:
+                    rewritten_lines.append("")
+                rewritten_lines.append(f"### {service}")
+                if price:
+                    rewritten_lines.append(f"- Precio: {price}")
+                continue
+
+        bullet_match = re.match(r"^\s*[•●▪◦\-*+]\s+(.+)$", line)
+        if bullet_match:
+            bullet_text = bullet_match.group(1).strip().rstrip("|").strip()
+            bullet_segments = [segment.strip() for segment in bullet_text.split("|") if segment.strip()]
+            for segment in bullet_segments:
+                segment = re.sub(r"^\s*[•●▪◦\-*+]\s+", "", segment).strip()
+                if segment:
+                    rewritten_lines.append(f"- {segment}")
+            continue
+
+        if "|" in line:
+            segments = [segment.strip() for segment in line.split("|") if segment.strip()]
+            for segment in segments:
+                segment_bullet = re.match(r"^\s*[•●▪◦\-*+]\s+(.+)$", segment)
+                if segment_bullet:
+                    segment_text = segment_bullet.group(1).strip()
+                    if segment_text:
+                        rewritten_lines.append(f"- {segment_text}")
+                elif (
+                    rewritten_lines
+                    and rewritten_lines[-1].startswith("- Precio:")
+                    and re.match(r"^[\d$€].{2,}$", segment)
+                ):
+                    rewritten_lines.append(f"- Precio: {segment}")
+                elif segment.lower() in {"pros", "contras", "precio", "servicio"}:
+                    continue
+                else:
+                    rewritten_lines.append(segment)
+            continue
+
+        if (
+            rewritten_lines
+            and rewritten_lines[-1].startswith("- Precio:")
+            and re.match(r"^[\d$€].{2,}$", line)
+        ):
+            extra_price = line.strip().rstrip("|").strip()
+            if extra_price:
+                rewritten_lines.append(f"- Precio: {extra_price}")
+            continue
+
+        line = line.strip("| ").strip()
+        line = re.sub(r"\s+\|\s*$", "", line)
+        if line:
+            rewritten_lines.append(line)
+
+    rewritten = "\n".join(rewritten_lines)
+    rewritten = re.sub(r"\n{3,}", "\n\n", rewritten).strip()
+
+    if not rewritten:
+        return cleaned
+
+    # Evitar devolver un resumen excesivamente truncado por un parser agresivo.
+    if len(rewritten) < max(40, int(len(cleaned) * 0.35)):
+        return cleaned
+
+    logger.info("Respuesta normalizada para mejorar formato visual.")
+    return rewritten
+
+
+def clear_user_history(user_id: str) -> bool:
+    """Limpia el historial de un usuario en memoria de sesion."""
+    had_history = bool(conversation_history.get(user_id))
+    conversation_history[user_id] = []
+    return had_history
+
+
+async def _build_web_context(message: str) -> tuple[str, list[dict[str, str]], str]:
+    """Detecta intencion de busqueda y construye contexto web."""
+    if not web_search_engine:
+        return "", [], ""
+
+    query = extract_search_intent(message)
+    message_lower = message.lower()
+
+    # Fallback: si no detectamos regex exacta pero hay señales fuertes,
+    # usamos el mensaje limpio como query.
+    if not query and WEB_INTENT_HINT_RE.search(message):
+        query = _normalize_web_query(message)
+
+    if not query:
+        return "", [], ""
+
+    if re.search(r"\b(precio|cotizaci[oó]n|valor)\b", message_lower):
+        if len(query.split()) <= 3 and "precio" not in query and "cotizacion" not in query:
+            query = f"precio actual de {query}"
+
+    use_news = any(word in message_lower for word in ("noticias", "news", "actualidad", "hoy"))
+    logger.info(f"Intencion web detectada. Query='{query}', news={use_news}")
+
+    if use_news:
+        results = await web_search_engine.search_news(query, max_results=5)
+    else:
+        results = await web_search_engine.search(query, max_results=5)
+
+    if not results:
+        logger.warning(f"Busqueda web sin resultados para query='{query}'")
+        return query, [], ""
+
+    lines = ["Resultados recientes de busqueda web para apoyar la respuesta:"]
+    for idx, result in enumerate(results, 1):
+        title = truncate_text(result.get("title", "").strip(), max_length=140)
+        snippet = truncate_text(result.get("snippet", "").strip(), max_length=220)
+        url = result.get("url", "").strip()
+        lines.append(f"{idx}. {title}")
+        if snippet:
+            lines.append(f"   Resumen: {snippet}")
+        if url:
+            lines.append(f"   Fuente: {url}")
+
+    return query, results, "\n".join(lines)
+
+
+async def _try_auto_reminder(message: str) -> Optional[str]:
+    """
+    Crea recordatorio automatico cuando el usuario lo pide explicitamente
+    y hay fecha/hora detectable en el mensaje.
+    """
+    if not reminder_manager:
+        return None
+
+    if not REMINDER_REQUEST_RE.search(message):
+        return None
+
+    if REMINDER_QUESTION_RE.search(message):
+        return None
+
+    # Si detectamos pedido de recordatorio, intentamos parsear fecha aunque
+    # el detector rapido de datetime no lo identifique.
+    has_datetime_hint = contains_datetime_reference(message)
+    try:
+        reminder = await reminder_manager.create_from_natural_language(message)
+    except ValueError as exc:
+        reason = str(exc).strip().lower()
+        if reason == "missing_datetime" and has_datetime_hint:
+            logger.info("Se detecto intencion de recordatorio, pero no se pudo parsear fecha.")
+        return None
+
+    if not reminder:
+        if has_datetime_hint:
+            logger.info("Se detecto intencion de recordatorio, pero no se pudo parsear fecha.")
+        return None
+
+    logger.info(f"Recordatorio creado automaticamente: {reminder['id']}")
+    reminder_date = reminder.get("datetime", "")
+    if reminder_manager and hasattr(reminder_manager, "format_datetime_for_user"):
+        reminder_date = reminder_manager.format_datetime_for_user(reminder_date)
+    return (
+        "He creado un recordatorio automatico para esto.\n"
+        f"- ID: {reminder['id']}\n"
+        f"- Texto: {reminder['text']}\n"
+        f"- Fecha: {reminder_date}"
+    )
+
+
+def _extract_reminder_delete_query(message: str) -> str:
+    """Extrae el texto objetivo a eliminar de una orden natural."""
+    cleaned = message.strip()
+    patterns = [
+        r"(?:recordatorio|recordatorios)\s+(?:de|del|para|sobre|que\s+dice|que\s+diga)\s+(.+)$",
+        (
+            r"(?:elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|"
+            r"remueve|remover|completa|completar)\s+"
+            r"(?:el|la|los|las|mi|mis|un|una)?\s*"
+            r"(?:recordatorio|recordatorios)?\s*(.+)$"
+        ),
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if not match:
+            continue
+        query = match.group(1).strip(" \t\n\r?¡!.,;:")
+        query = re.sub(r"^(de|del|para|sobre)\s+", "", query, flags=re.IGNORECASE)
+        if query and query.lower() not in {"recordatorio", "recordatorios"}:
+            return query
+    return ""
+
+
+async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
+    """
+    Maneja acciones de recordatorios de forma deterministica en chat libre:
+    crear, listar/consultar y eliminar/quitar.
+    """
+    if not reminder_manager:
+        return None
+
+    message_clean = message.strip()
+    message_lower = message_clean.lower()
+
+    if REMINDER_LIST_RE.search(message_clean):
+        return reminder_manager.format_active_reminders_for_chat()
+
+    if REMINDER_DELETE_RE.search(message_clean):
+        if REMINDER_DELETE_ALL_RE.search(message_clean):
+            deleted_count = reminder_manager.delete_all_active()
+            if deleted_count == 0:
+                return "No habia recordatorios activos para eliminar."
+            return f"Listo, elimine {deleted_count} recordatorio(s) activos."
+
+        id_match = REMINDER_ID_RE.search(message_lower)
+        if id_match:
+            reminder_id = id_match.group(1)
+            deleted = reminder_manager.delete_reminder(reminder_id)
+            if deleted:
+                return f"Listo, elimine el recordatorio [{reminder_id}]."
+            return f"No encontre un recordatorio activo con ID {reminder_id}."
+
+        query = _extract_reminder_delete_query(message_clean)
+        if not query:
+            return (
+                "Puedo eliminarlo, pero necesito el ID o parte del texto. "
+                "Ejemplo: 'elimina el recordatorio para tomar cafe'."
+            )
+
+        deleted_reminder = reminder_manager.delete_reminder_by_text(query)
+        if not deleted_reminder:
+            return "No encontre un recordatorio activo que coincida con eso."
+
+        formatted_dt = reminder_manager.format_datetime_for_user(deleted_reminder["datetime"])
+        return (
+            "Listo, elimine este recordatorio:\n"
+            f"- [{deleted_reminder['id']}] {deleted_reminder['text']}\n"
+            f"- Fecha: {formatted_dt}"
+        )
+
+    pending = _get_pending_reminder(user_id)
+    is_creation_request = _looks_like_reminder_creation_request(message_clean)
+
+    if pending and not is_creation_request:
+        if REMINDER_PENDING_CANCEL_RE.search(message_clean):
+            pending_reminder_by_user.pop(user_id, None)
+            return "Listo, cancele ese recordatorio pendiente."
+
+        if _looks_like_reminder_task_followup(message_clean):
+            try:
+                reminder = reminder_manager.create_reminder(
+                    text=message_clean,
+                    dt=pending["datetime"],
+                )
+            except ValueError as exc:
+                reason = str(exc).strip().lower()
+                if reason == "missing_task":
+                    return (
+                        "Aun me falta la accion concreta del recordatorio. "
+                        "Ejemplo: 'para ir a tomar cafe'."
+                    )
+                pending_reminder_by_user.pop(user_id, None)
+                return "No pude crear el recordatorio pendiente. Intentemos de nuevo."
+
+            pending_reminder_by_user.pop(user_id, None)
+            reminder_date = reminder_manager.format_datetime_for_user(reminder["datetime"])
+            return (
+                "Listo, cree este recordatorio:\n"
+                f"- ID: {reminder['id']}\n"
+                f"- Texto: {reminder['text']}\n"
+                f"- Fecha: {reminder_date}"
+            )
+
+    # Si es pregunta/queja sobre recordatorios, dejar que el LLM responda.
+    if REMINDER_QUESTION_RE.search(message_clean):
+        return None
+
+    if is_creation_request:
+        try:
+            reminder = await reminder_manager.create_from_natural_language(message_clean)
+        except ValueError as exc:
+            reason = str(exc).strip().lower()
+            if reason == "missing_task":
+                parsed_dt = None
+                if hasattr(reminder_manager, "_extract_text_and_datetime"):
+                    try:
+                        _, parsed_dt = reminder_manager._extract_text_and_datetime(message_clean)
+                    except Exception:
+                        parsed_dt = None
+
+                if parsed_dt:
+                    pending_reminder_by_user[user_id] = {
+                        "datetime": parsed_dt.isoformat(),
+                        "created_at": datetime.now().isoformat(),
+                    }
+                return (
+                    "Ya tengo la hora del recordatorio, pero me falta para que es. "
+                    "Dime la accion. Ejemplo: 'para ir a tomar cafe'."
+                )
+            return (
+                "Puedo crear el recordatorio, pero necesito fecha/hora clara. "
+                "Ejemplo: 'recuerdame tomar cafe en 10 minutos'."
+            )
+
+        if not reminder:
+            return (
+                "Puedo crear el recordatorio, pero necesito fecha/hora clara. "
+                "Ejemplo: 'recuerdame tomar cafe en 10 minutos'."
+            )
+
+        pending_reminder_by_user.pop(user_id, None)
+        reminder_date = reminder_manager.format_datetime_for_user(reminder["datetime"])
+        return (
+            "Listo, cree este recordatorio:\n"
+            f"- ID: {reminder['id']}\n"
+            f"- Texto: {reminder['text']}\n"
+            f"- Fecha: {reminder_date}"
+        )
+
+    return None
+
+
+async def process_chat_message(message: str, user_id: str, source: str = "api") -> str:
+    """
+    Flujo principal de chat compartido por API y Telegram.
+    """
+    logger.info(f"[{source}] Mensaje de {user_id}: {message[:120]}...")
+
+    history = conversation_history.setdefault(user_id, [])
+    history.append({"role": "user", "content": message})
+    if len(history) > MAX_CONTEXT_MESSAGES:
+        del history[:-MAX_CONTEXT_MESSAGES]
+
+    response_text: str
+    deterministic_reminder_response = await _handle_reminder_action(message, user_id)
+    if deterministic_reminder_response is not None:
+        response_text = deterministic_reminder_response
+    else:
+        memory_context = ""
+        if memory_manager:
+            memory_context = await memory_manager.search_relevant_context(query=message, n=5)
+            memory_context = _sanitize_memory_context(memory_context)
+
+        web_query, web_results, web_context = await _build_web_context(message)
+        combined_context = "\n\n".join(
+            part for part in (memory_context.strip(), web_context.strip()) if part
+        )
+
+        active_reminders = ""
+        if reminder_manager:
+            active_reminders = reminder_manager.get_active_reminders_text()
+
+        system_prompt = build_system_prompt(
+            memory_context=combined_context or None,
+            active_reminders=active_reminders or None,
+        )
+
+        model_history = _sanitize_history_for_generation(history)
+        response_text = await llm_engine.generate_response(
+            messages=model_history,
+            system_prompt=system_prompt,
+        )
+
+        # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
+        if web_results and (
+            not response_text.strip()
+            or response_text.startswith("Error:")
+            or response_text.strip().upper() == "NADA"
+            or len(response_text.strip()) <= 8
+            or "no pude generar una respuesta" in response_text.lower()
+        ):
+            lines = [f"Encontre esto para: {web_query}"]
+            for idx, result in enumerate(web_results[:5], 1):
+                lines.append(f"{idx}. {result.get('title', '').strip()}")
+                snippet = result.get("snippet", "").strip()
+                if snippet:
+                    lines.append(f"   {snippet}")
+                url = result.get("url", "").strip()
+                if url:
+                    lines.append(f"   {url}")
+            response_text = "\n".join(lines)
+
+        # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
+        # intentamos una busqueda directa con el mensaje completo.
+        if (
+            web_search_engine
+            and not web_results
+            and (
+                not response_text.strip()
+                or response_text.startswith("Error:")
+                or "no pude generar una respuesta" in response_text.lower()
+                or response_text.strip().upper() == "NADA"
+                or len(response_text.strip()) <= 8
+            )
+        ):
+            rescue_query = _normalize_web_query(message)
+            if rescue_query:
+                rescue_results = await web_search_engine.search(rescue_query, max_results=5)
+                if rescue_results:
+                    lines = [f"Encontre esto para: {rescue_query}"]
+                    for idx, result in enumerate(rescue_results[:5], 1):
+                        lines.append(f"{idx}. {result.get('title', '').strip()}")
+                        snippet = result.get("snippet", "").strip()
+                        if snippet:
+                            lines.append(f"   {snippet}")
+                        url = result.get("url", "").strip()
+                        if url:
+                            lines.append(f"   {url}")
+                    response_text = "\n".join(lines)
+
+        # Reintento defensivo: cuando el modelo responde rechazo generico
+        # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
+        if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
+            logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
+            retry_prompt = (
+                f"{system_prompt}\n\n"
+                "La solicitud actual es benigna y permitida. "
+                "Responde de forma util y breve; no devuelvas rechazos genericos."
+            )
+            retry_response = await llm_engine.generate_response(
+                messages=_sanitize_history_for_generation(history),
+                system_prompt=retry_prompt,
+            )
+            if retry_response.strip() and not _is_generic_refusal(retry_response):
+                response_text = retry_response
+
+        auto_reminder_note = await _try_auto_reminder(message)
+        if auto_reminder_note:
+            response_text = _remove_reminder_denials(response_text)
+            response_text = f"{response_text}\n\n{auto_reminder_note}"
+
+    response_text = _normalize_response_format(response_text)
+
+    history.append({"role": "assistant", "content": response_text})
+    if len(history) > MAX_CONTEXT_MESSAGES:
+        del history[:-MAX_CONTEXT_MESSAGES]
+
+    if memory_manager and not _is_generic_refusal(response_text):
+        await memory_manager.extract_and_store_info(history, llm_engine)
+        summary = truncate_text(
+            f"Usuario: {message}\nAsistente: {response_text}",
+            max_length=900,
+        )
+        await memory_manager.store_conversation_summary(
+            summary,
+            metadata={"source": source, "user_id": user_id},
+        )
+    elif memory_manager:
+        logger.info("No se guardo resumen en memoria: respuesta de rechazo generico.")
+
+    logger.info(f"[{source}] Respuesta para {user_id}: {response_text[:120]}...")
+    return response_text
+
+
+async def _telegram_supervisor_loop(retry_seconds: int = 20) -> None:
+    """
+    Supervisa el bot de Telegram y reintenta arranque si falla por red/DNS.
+    Evita que el servicio quede sin Telegram despues de reinicio.
+    """
+    while True:
+        await asyncio.sleep(retry_seconds)
+        if not telegram_bot:
+            continue
+        try:
+            if not telegram_bot.is_running():
+                logger.warning("Bot de Telegram no activo. Reintentando inicio...")
+                await telegram_bot.start_polling()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error en supervisor de Telegram: {exc}")
+
+
+# --- Lifespan (startup/shutdown) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manejo de inicio y cierre del servidor."""
+    global telegram_bot, telegram_task
+
+    logger.info("Iniciando servidor del agente de IA...")
+    ollama_ok = await llm_engine.check_health()
+    if ollama_ok:
+        logger.info("Ollama esta disponible y listo")
+    else:
+        logger.warning(
+            "Ollama NO esta disponible. "
+            "Asegurate de ejecutar: ollama serve"
+        )
+
+    if TelegramBot is not None:
+        try:
+            telegram_bot = TelegramBot(
+                chat_handler=process_chat_message,
+                memory_manager=memory_manager,
+                reminder_manager=reminder_manager,
+                web_search=web_search_engine,
+                clear_history_handler=clear_user_history,
+            )
+            if reminder_manager and telegram_bot:
+                reminder_manager.telegram_send_fn = telegram_bot.send_message
+            await telegram_bot.start_polling()
+            telegram_task = asyncio.create_task(
+                _telegram_supervisor_loop(),
+                name="telegram-supervisor",
+            )
+        except Exception as exc:
+            logger.error(f"No se pudo iniciar el bot de Telegram: {exc}")
+            telegram_bot = None
+            telegram_task = None
+
+    if reminder_manager:
+        reminder_manager.start_scheduler()
+
+    try:
+        yield
+    finally:
+        if reminder_manager:
+            reminder_manager.stop_scheduler()
+
+        if telegram_bot:
+            await telegram_bot.stop()
+
+        if telegram_task:
+            telegram_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await telegram_task
+
+        await llm_engine.close()
+        logger.info("Servidor detenido")
+
+
+# --- Aplicacion FastAPI ---
+app = FastAPI(
+    title="Agente de IA Local",
+    description="Agente de IA personal con Ollama",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# --- Endpoints ---
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    """Endpoint principal de chat."""
+    response_text = await process_chat_message(
+        message=request.message,
+        user_id=request.user_id,
+        source=request.source,
+    )
+    return ChatResponse(response=response_text)
+
+
+@app.post("/remember", response_model=RememberResponse)
+async def remember(request: RememberRequest) -> RememberResponse:
+    """Guarda informacion manualmente en memoria de largo plazo."""
+    if not memory_manager:
+        raise HTTPException(status_code=503, detail="Sistema de memoria no disponible.")
+
+    info = request.info.strip()
+    if len(info) < 3:
+        raise HTTPException(status_code=400, detail="La informacion es demasiado corta.")
+
+    metadata = {"source": "manual_api", "user_id": request.user_id}
+    if request.metadata:
+        metadata.update(request.metadata)
+
+    stored = await memory_manager.store_user_info(info=info, metadata=metadata)
+    if stored:
+        return RememberResponse(stored=True, message="Informacion guardada correctamente.")
+    return RememberResponse(stored=False, message="La informacion ya existia en memoria.")
+
+
+@app.get("/reminders", response_model=RemindersResponse)
+async def list_reminders() -> RemindersResponse:
+    """Lista todos los recordatorios."""
+    if not reminder_manager:
+        raise HTTPException(status_code=503, detail="Sistema de recordatorios no disponible.")
+    return RemindersResponse(reminders=reminder_manager.get_all_reminders())
+
+
+@app.post("/reminders")
+async def create_reminder(request: ReminderCreateRequest) -> dict[str, Any]:
+    """Crea un recordatorio desde texto natural o fecha explicita."""
+    if not reminder_manager:
+        raise HTTPException(status_code=503, detail="Sistema de recordatorios no disponible.")
+
+    try:
+        if request.datetime:
+            reminder = reminder_manager.create_reminder(
+                text=request.text,
+                dt=request.datetime,
+                recurring=request.recurring,
+                interval=request.interval,
+            )
+        else:
+            reminder = await reminder_manager.create_from_natural_language(request.text)
+    except ValueError as exc:
+        reason = str(exc).strip().lower()
+        if reason == "missing_task":
+            detail = (
+                "Falta el objetivo del recordatorio. "
+                "Ejemplo: 'recordatorio para las 10:11 para ir a comer'."
+            )
+        elif reason == "missing_datetime":
+            detail = "No se pudo interpretar la fecha/hora del recordatorio."
+        else:
+            detail = str(exc)
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+    if not reminder:
+        raise HTTPException(
+            status_code=400,
+            detail="No se pudo interpretar la fecha del recordatorio.",
+        )
+    return reminder
+
+
+@app.delete("/reminders/{reminder_id}", response_model=ReminderDeleteResponse)
+async def delete_reminder(reminder_id: str) -> ReminderDeleteResponse:
+    """Marca un recordatorio como completado."""
+    if not reminder_manager:
+        raise HTTPException(status_code=503, detail="Sistema de recordatorios no disponible.")
+
+    deleted = reminder_manager.delete_reminder(reminder_id)
+    if deleted:
+        return ReminderDeleteResponse(deleted=True, message="Recordatorio eliminado.")
+    return ReminderDeleteResponse(deleted=False, message="Recordatorio no encontrado.")
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Verifica el estado del servidor y la conexion a Ollama."""
+    ollama_ok = await llm_engine.check_health()
+    return HealthResponse(status="ok", ollama=ollama_ok)
+
+
+# --- Servir frontend ---
+@app.get("/")
+async def serve_index():
+    """Sirve la pagina principal del frontend."""
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(
+            str(index_path),
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+    return {"message": "Frontend no disponible. Se habilitara en la Fase 3."}
+
+
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+# --- Punto de entrada ---
+if __name__ == "__main__":
+    logger.info(f"Iniciando servidor en http://{HOST}:{PORT}")
+    uvicorn.run(
+        "app.main:app" if RELOAD else app,
+        host=HOST,
+        port=PORT,
+        reload=RELOAD,
+        log_level="info",
+    )
