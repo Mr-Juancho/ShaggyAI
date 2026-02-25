@@ -6,6 +6,7 @@ Comparte backend y memoria con la interfaz desktop.
 import asyncio
 import re
 from typing import Optional
+from html import unescape
 
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -69,15 +70,109 @@ class TelegramBot:
             return False
         return True
 
+    def _split_inline_numbered_items(self, line: str) -> list[str]:
+        """
+        Convierte lineas tipo:
+        '- 1) A. 2) B. 3) C.'
+        en bullets separados para legibilidad en Telegram.
+        """
+        raw = (line or "").strip()
+        if not raw:
+            return []
+
+        probe = raw
+        if probe.startswith("- "):
+            probe = probe[2:].strip()
+
+        if len(re.findall(r"\b\d+[.)]\s+", probe)) < 2:
+            return [raw]
+
+        items: list[str] = []
+        for match in re.finditer(r"(\d+[.)])\s*(.*?)(?=(?:\s+\d+[.)]\s)|$)", probe):
+            label = match.group(1).strip()
+            text = match.group(2).strip(" \t\n\r.;,")
+            if not text:
+                continue
+            items.append(f"- {label} {text}")
+
+        return items if items else [raw]
+
+    def _is_source_like_line(self, line: str) -> bool:
+        """Heuristica para detectar lineas de fuentes reales."""
+        lowered = (line or "").lower().strip()
+        if not lowered:
+            return False
+        if "http://" in lowered or "https://" in lowered:
+            return True
+        if re.search(r"\b[a-z0-9-]+\.(com|org|net|edu|gov|io|co|es|tv|news)\b", lowered):
+            return True
+        source_keywords = (
+            "forbes",
+            "reuters",
+            "bloomberg",
+            "wikipedia",
+            "bbc",
+            "cnbc",
+            "nyt",
+            "the guardian",
+            "wsj",
+        )
+        return any(keyword in lowered for keyword in source_keywords)
+
+    def _drop_empty_source_headers(self, lines: list[str]) -> list[str]:
+        """
+        Elimina encabezados 'Fuentes' vacios o mal usados cuando no hay URLs/dominios debajo.
+        """
+        cleaned: list[str] = []
+        i = 0
+        while i < len(lines):
+            current = (lines[i] or "").strip()
+            is_sources_header = bool(
+                re.fullmatch(r"-?\s*(principales?\s+fuentes?|fuentes?)\s*:?\s*", current, flags=re.IGNORECASE)
+            )
+            if not is_sources_header:
+                cleaned.append(lines[i])
+                i += 1
+                continue
+
+            lookahead: list[str] = []
+            j = i + 1
+            while j < len(lines) and len(lookahead) < 4:
+                nxt = (lines[j] or "").strip()
+                if nxt:
+                    lookahead.append(nxt)
+                j += 1
+
+            has_real_sources = any(self._is_source_like_line(candidate) for candidate in lookahead)
+            if has_real_sources:
+                cleaned.append(lines[i])
+            i += 1
+
+        return cleaned
+
     def _normalize_telegram_text(self, text: str) -> str:
         """Limpia formatos no compatibles con Telegram (tablas HTML/Markdown complejo)."""
-        normalized = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-        normalized = re.sub(r"</?(div|span|p|table|tbody|thead|tr|td|th)>", "", normalized, flags=re.IGNORECASE)
+        normalized = unescape(text or "")
+        normalized = normalized.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        normalized = re.sub(
+            r"</?(div|span|p|table|tbody|thead|tr|td|th|ul|ol|li|h1|h2|h3|h4|strong|em|b|i)>",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(r"<[^>]+>", "", normalized)
 
         lines = normalized.splitlines()
         out_lines: list[str] = []
+        prev_was_bullet = False
         for line in lines:
             stripped = line.strip()
+            if not stripped:
+                if out_lines and out_lines[-1] != "":
+                    out_lines.append("")
+                prev_was_bullet = False
+                continue
+
             # Convertir filas de tablas markdown en lineas legibles.
             if stripped.count("|") >= 2:
                 cells = [c.strip() for c in stripped.split("|")]
@@ -85,36 +180,118 @@ class TelegramBot:
                     continue
                 cells = [c for c in cells if c]
                 if len(cells) >= 2:
-                    out_lines.append(f"- {cells[0]}: {' | '.join(cells[1:])}")
+                    head = cells[0]
+                    out_lines.append(f"- {head}: {cells[1]}")
+                    for extra in cells[2:]:
+                        out_lines.append(f"  - {extra}")
+                    out_lines.append("")
                 elif cells:
                     out_lines.append(f"- {cells[0]}")
+                    out_lines.append("")
+                prev_was_bullet = True
                 continue
 
             if stripped == "|":
                 continue
-            out_lines.append(line.rstrip("|").rstrip())
+            # Quitar adornos markdown ruidosos en Telegram.
+            stripped = re.sub(r"^#{1,4}\s*", "", stripped)
+            stripped = stripped.replace("**", "").replace("__", "")
+            stripped = stripped.replace("`", "").replace("\\*", "")
+            stripped = re.sub(r"\*{1,3}", "", stripped)
+            stripped = stripped.rstrip("|").rstrip()
 
+            expanded = self._split_inline_numbered_items(stripped)
+            if len(expanded) > 1:
+                if out_lines and out_lines[-1] != "":
+                    out_lines.append("")
+                out_lines.extend(expanded)
+                out_lines.append("")
+                prev_was_bullet = True
+                continue
+
+            is_bullet = bool(re.match(r"^[-•]\s+", stripped))
+            if is_bullet and out_lines and out_lines[-1] and not prev_was_bullet:
+                out_lines.append("")
+            out_lines.append(stripped)
+            prev_was_bullet = is_bullet
+
+        out_lines = self._drop_empty_source_headers(out_lines)
         normalized = "\n".join(out_lines)
-        normalized = normalized.replace("### ", "").replace("## ", "")
+        normalized = normalized.replace("* ", "- ")
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
         return normalized.strip()
+
+    def _compact_telegram_text(
+        self,
+        text: str,
+        max_chars: int = 950,
+        max_lines: int = 14,
+        max_bullets: int = 10,
+    ) -> str:
+        """Compacta respuesta para lectura rapida en Telegram."""
+        cleaned = self._normalize_telegram_text(text)
+        if not cleaned:
+            return cleaned
+
+        lines = [ln.rstrip() for ln in cleaned.splitlines()]
+        if not lines:
+            return ""
+
+        compact_lines: list[str] = []
+        bullet_count = 0
+        visible_lines = 0
+        trimmed = False
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                if compact_lines and compact_lines[-1] != "":
+                    compact_lines.append("")
+                continue
+
+            is_bullet = bool(re.match(r"^[-•]\s+", line))
+
+            if is_bullet:
+                bullet_count += 1
+                if bullet_count > max_bullets:
+                    trimmed = True
+                    continue
+
+            if len(line) > 180:
+                line = f"{line[:177].rstrip()}..."
+                trimmed = True
+
+            compact_lines.append(line)
+            visible_lines += 1
+            if visible_lines >= max_lines:
+                trimmed = True
+                break
+
+        compact = "\n".join(compact_lines).strip()
+        compact = re.sub(r"\n{3,}", "\n\n", compact)
+        if len(compact) > max_chars:
+            compact = f"{compact[:max_chars].rstrip()}..."
+            trimmed = True
+
+        if trimmed and "dime 'detalle'" not in compact.lower():
+            compact = f"{compact}\n\nSi quieres version completa, dime: detalle."
+        return compact
 
     async def _split_and_send(
         self,
         update: Update,
         text: str,
-        max_length: int = 4096
+        max_length: int = 4096,
+        compact: bool = True,
     ) -> None:
         """Divide mensajes largos y los envia con soporte Markdown."""
-        text = self._normalize_telegram_text(text)
+        if compact:
+            text = self._compact_telegram_text(text)
+        else:
+            text = self._normalize_telegram_text(text)
+
         if len(text) <= max_length:
-            try:
-                await update.message.reply_text(
-                    text, parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception:
-                # Si falla el markdown, enviar como texto plano
-                await update.message.reply_text(text)
+            await update.message.reply_text(text)
             return
 
         # Dividir en chunks respetando saltos de linea
@@ -131,12 +308,7 @@ class TelegramBot:
             chunks.append(current)
 
         for chunk in chunks:
-            try:
-                await update.message.reply_text(
-                    chunk, parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception:
-                await update.message.reply_text(chunk)
+            await update.message.reply_text(chunk)
             await asyncio.sleep(0.3)
 
     # ==========================================
@@ -296,9 +468,19 @@ class TelegramBot:
             await update.message.chat.send_action(ChatAction.TYPING)
             results = await self.web_search.search(query)
             if results:
-                text = f"*Resultados para:* {query}\n\n"
-                for r in results:
-                    text += f"*{r['title']}*\n{r['snippet']}\n{r['url']}\n\n"
+                text = f"Resultados para: {query}\n"
+                for idx, r in enumerate(results[:3], 1):
+                    title = (r.get("title") or "").strip()
+                    snippet = re.sub(r"\s+", " ", (r.get("snippet") or "")).strip()
+                    snippet = re.sub(r"<[^>]+>", " ", snippet).strip()
+                    if len(snippet) > 140:
+                        snippet = f"{snippet[:137].rstrip()}..."
+                    url = (r.get("url") or "").strip()
+                    text += f"\n{idx}) {title}\n"
+                    if snippet:
+                        text += f"- {snippet}\n"
+                    if url:
+                        text += f"- {url}\n"
                 await self._split_and_send(update, text)
             else:
                 await update.message.reply_text("No se encontraron resultados.")
@@ -329,7 +511,14 @@ class TelegramBot:
                 user_id=user_id,
                 source="telegram"
             )
-            await self._split_and_send(update, response)
+            wants_full = bool(
+                re.search(
+                    r"\b(detalle|detallado|completo|expandir|amplia|ampliar)\b",
+                    user_message,
+                    flags=re.IGNORECASE,
+                )
+            )
+            await self._split_and_send(update, response, compact=not wants_full)
 
         except Exception as e:
             logger.error(f"Error procesando mensaje de Telegram: {e}")

@@ -7,7 +7,9 @@ import asyncio
 import re
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta
+from html import unescape
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -189,7 +191,7 @@ REMINDER_DENIAL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 WEB_INTENT_HINT_RE = re.compile(
-    r"\b(busca|buscar|investiga|consulta|averigua|web|internet|google|precio|cotizaci[oó]n|valor|noticias?|qu[ií]en|presidente|actual)\b",
+    r"\b(busca|buscar|investiga|consulta|averigua|actualiza|actualizar|web|internet|google|precio|cotizaci[oó]n|valor|noticias?|qu[ií]en|presidente|actual)\b",
     flags=re.IGNORECASE,
 )
 TABLE_SEPARATOR_LINE_RE = re.compile(
@@ -202,6 +204,85 @@ GENERIC_REFUSAL_RE = re.compile(
 )
 BENIGN_OPINION_HINT_RE = re.compile(
     r"\b(opini[oó]n|opinas|pel[ií]cula|pel[ií]culas|serie|series|libro|m[uú]sica|juego|recomienda|truman)\b",
+    flags=re.IGNORECASE,
+)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WEB_QUERY_STOPWORDS = {
+    "a",
+    "actual",
+    "actuales",
+    "actualiza",
+    "actualizar",
+    "actualizado",
+    "actualizada",
+    "actualizados",
+    "actualizadas",
+    "ahora",
+    "averigua",
+    "buscar",
+    "busca",
+    "compara",
+    "comparame",
+    "comparar",
+    "con",
+    "consulta",
+    "de",
+    "del",
+    "dato",
+    "datos",
+    "dinero",
+    "bien",
+    "el",
+    "en",
+    "es",
+    "esta",
+    "este",
+    "esto",
+    "google",
+    "haz",
+    "hace",
+    "hoy",
+    "informacion",
+    "internet",
+    "investiga",
+    "investigar",
+    "la",
+    "las",
+    "los",
+    "me",
+    "mi",
+    "nueva",
+    "nuevas",
+    "nuevo",
+    "nuevos",
+    "otra",
+    "otravez",
+    "para",
+    "por",
+    "que",
+    "repite",
+    "repetir",
+    "sobre",
+    "tabla",
+    "ultimas",
+    "ultimos",
+    "ultimo",
+    "ultima",
+    "un",
+    "una",
+    "uno",
+    "web",
+    "y",
+}
+WEB_FOLLOWUP_REFRESH_RE = re.compile(
+    r"\b(actualiza|actualizar|ultim[oa]s?|datos?\s+recientes|de\s+nuevo|otra\s+vez|nuevamente|repite)\b",
+    flags=re.IGNORECASE,
+)
+WEB_EXPLICIT_REQUEST_RE = re.compile(
+    r"^\s*/search\b|"
+    r"\b(busca|buscar|buscame|búscame|investiga|investigar|consulta|consultar|"
+    r"averigua|averiguar|googlea|googlear|search)\b|"
+    r"\b(en\s+(?:la\s+)?(?:web|internet|google))\b",
     flags=re.IGNORECASE,
 )
 
@@ -224,6 +305,98 @@ def _normalize_web_query(text: str) -> str:
     return cleaned.strip(" \t\n\r?¡!.,;:")
 
 
+def _channel_prompt_addendum(source: str) -> str:
+    """Instrucciones extra de estilo segun el canal de salida."""
+    if source == "telegram":
+        return (
+            "--- Modo Telegram ---\n"
+            "Responde breve y clara.\n"
+            "Maximo 6 lineas en respuestas normales.\n"
+            "Usa bullets simples cuando ayude.\n"
+            "No uses markdown decorativo como **texto** o __texto__.\n"
+            "No pongas listas '1) 2) 3)' en la misma linea; cada punto debe ir en linea separada.\n"
+            "Evita tablas y bloques largos.\n"
+            "Si no hay contexto de busqueda web, no inventes ni cites fuentes externas.\n"
+            "No agregues un encabezado de 'Fuentes' si no tienes fuentes reales verificables.\n"
+            "Si el usuario pide detalle, entonces amplia."
+        )
+    return ""
+
+
+def _is_explicit_web_request(message: str) -> bool:
+    """Solo activa web search cuando el usuario lo pide explicitamente."""
+    return bool(WEB_EXPLICIT_REQUEST_RE.search(message or ""))
+
+
+def _tokenize_web_terms(text: str) -> list[str]:
+    """Tokeniza texto para estimar si una consulta web tiene señal semantica."""
+    return re.findall(r"[a-z0-9áéíóúñ+.-]{2,}", text.lower())
+
+
+def _is_low_signal_web_query(query: str) -> bool:
+    """Detecta consultas genericas tipo 'ultimos datos y haz tabla de nuevo'."""
+    tokens = _tokenize_web_terms(query)
+    if not tokens:
+        return True
+    meaningful = [token for token in tokens if token not in WEB_QUERY_STOPWORDS]
+    return len(meaningful) == 0
+
+
+def _extract_topic_hint_from_text(text: str, max_terms: int = 7) -> str:
+    """
+    Extrae terminos tema de un mensaje previo para enriquecer follow-ups web.
+    Ejemplo: 'compara Disney vs Netflix en tabla' -> 'Disney Netflix'.
+    """
+    cleaned = _normalize_web_query(text)
+    cleaned = re.sub(
+        r"\b(haz|hace|dame|quiero|necesito)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\b(de\s+nuevo|otra\s+vez|nuevamente)\b", " ", cleaned, flags=re.IGNORECASE)
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw_token in re.findall(r"[A-Za-z0-9ÁÉÍÓÚáéíóúÑñ+.-]{2,}", cleaned):
+        token_l = raw_token.lower()
+        if token_l in WEB_QUERY_STOPWORDS:
+            continue
+        if token_l.isdigit():
+            continue
+        if token_l in seen:
+            continue
+        seen.add(token_l)
+        terms.append(raw_token)
+        if len(terms) >= max_terms:
+            break
+    return " ".join(terms).strip()
+
+
+def _infer_topic_hint_from_history(
+    history: list[dict[str, str]],
+    current_message: str
+) -> str:
+    """Busca el ultimo mensaje del usuario con tema util para busqueda web."""
+    if not history:
+        return ""
+
+    current_l = current_message.strip().lower()
+    # Recorremos hacia atras y tomamos el ultimo mensaje de usuario con señal tematica.
+    for item in reversed(history[:-1]):
+        if item.get("role") != "user":
+            continue
+        content = item.get("content", "").strip()
+        if not content:
+            continue
+        if content.strip().lower() == current_l:
+            continue
+        topic_hint = _extract_topic_hint_from_text(content)
+        if topic_hint:
+            return topic_hint
+    return ""
+
+
 def _remove_reminder_denials(text: str) -> str:
     """Elimina frases donde el modelo niega poder crear recordatorios."""
     lines = [line for line in text.splitlines() if not REMINDER_DENIAL_RE.search(line)]
@@ -231,6 +404,95 @@ def _remove_reminder_denials(text: str) -> str:
     if not cleaned:
         return "Listo, ya programe tu recordatorio."
     return cleaned
+
+
+def _sanitize_web_text(value: str, max_length: int = 220) -> str:
+    """Limpia texto proveniente de buscadores (quita HTML y compacta espacios)."""
+    if not value:
+        return ""
+    cleaned = unescape(str(value))
+    cleaned = HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\r-–—|")
+    if not cleaned:
+        return ""
+    return truncate_text(cleaned, max_length=max_length)
+
+
+def _source_markdown_link(url: str) -> str:
+    """Convierte URL en markdown corto con dominio como etiqueta."""
+    safe_url = (url or "").strip()
+    if not safe_url:
+        return ""
+    try:
+        parsed = urlparse(safe_url)
+        domain = (parsed.netloc or "").lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if domain:
+            return f"[{domain}]({safe_url})"
+    except Exception:
+        pass
+    return safe_url
+
+
+def _format_web_results_for_user(query: str, results: list[dict[str, str]], max_results: int = 5) -> str:
+    """Da formato legible y consistente a resultados web para mostrar al usuario."""
+    safe_query = _sanitize_web_text(query, max_length=120) or "tu consulta"
+    lines = [f"Resultados web para **{safe_query}**:"]
+
+    for idx, result in enumerate(results[:max_results], 1):
+        title = _sanitize_web_text(result.get("title", ""), max_length=140) or "Resultado sin titulo"
+        snippet = _sanitize_web_text(result.get("snippet", ""), max_length=220)
+        source_md = _source_markdown_link(result.get("url", ""))
+
+        detail_parts: list[str] = []
+        if snippet:
+            detail_parts.append(snippet)
+        if source_md:
+            detail_parts.append(f"Fuente: {source_md}")
+
+        if detail_parts:
+            lines.append(f"{idx}. **{title}** — {' | '.join(detail_parts)}")
+        else:
+            lines.append(f"{idx}. **{title}**")
+
+    return "\n".join(lines)
+
+
+def _append_telegram_sources_block(text: str, results: list[dict[str, str]], max_sources: int = 3) -> str:
+    """Agrega fuentes reales (dominio) en Telegram cuando hubo busqueda web."""
+    if not text:
+        return text
+    if not results:
+        return text
+    if re.search(r"\bfuentes?\b", text, flags=re.IGNORECASE):
+        return text
+
+    sources: list[str] = []
+    seen_domains: set[str] = set()
+    for result in results:
+        url = (result.get("url", "") or "").strip()
+        if not url:
+            continue
+        try:
+            parsed = urlparse(url)
+            domain = (parsed.netloc or "").lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if not domain or domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            sources.append(domain)
+            if len(sources) >= max_sources:
+                break
+        except Exception:
+            continue
+
+    if not sources:
+        return text
+
+    source_lines = ["Fuentes:", *[f"- {domain}" for domain in sources]]
+    return f"{text.strip()}\n\n" + "\n".join(source_lines)
 
 
 def _get_pending_reminder(user_id: str) -> Optional[dict[str, str]]:
@@ -511,12 +773,20 @@ def clear_user_history(user_id: str) -> bool:
     return had_history
 
 
-async def _build_web_context(message: str) -> tuple[str, list[dict[str, str]], str]:
+async def _build_web_context(
+    message: str,
+    history: Optional[list[dict[str, str]]] = None,
+    allow_web_search: bool = True,
+) -> tuple[str, list[dict[str, str]], str]:
     """Detecta intencion de busqueda y construye contexto web."""
     if not web_search_engine:
         return "", [], ""
+    if not allow_web_search:
+        return "", [], ""
 
     query = extract_search_intent(message)
+    if query:
+        query = _normalize_web_query(query)
     message_lower = message.lower()
 
     # Fallback: si no detectamos regex exacta pero hay señales fuertes,
@@ -526,6 +796,18 @@ async def _build_web_context(message: str) -> tuple[str, list[dict[str, str]], s
 
     if not query:
         return "", [], ""
+
+    # Cuando el usuario dice algo tipo "actualiza los ultimos datos y rehace tabla",
+    # reutilizamos el tema del turno previo para evitar queries basura.
+    if (
+        history
+        and _is_low_signal_web_query(query)
+        and WEB_FOLLOWUP_REFRESH_RE.search(message_lower)
+    ):
+        topic_hint = _infer_topic_hint_from_history(history, message)
+        if topic_hint:
+            query = f"{topic_hint} datos actuales"
+            logger.info(f"Query web enriquecida por contexto: '{query}'")
 
     if re.search(r"\b(precio|cotizaci[oó]n|valor)\b", message_lower):
         if len(query.split()) <= 3 and "precio" not in query and "cotizacion" not in query:
@@ -545,8 +827,8 @@ async def _build_web_context(message: str) -> tuple[str, list[dict[str, str]], s
 
     lines = ["Resultados recientes de busqueda web para apoyar la respuesta:"]
     for idx, result in enumerate(results, 1):
-        title = truncate_text(result.get("title", "").strip(), max_length=140)
-        snippet = truncate_text(result.get("snippet", "").strip(), max_length=220)
+        title = _sanitize_web_text(result.get("title", ""), max_length=140)
+        snippet = _sanitize_web_text(result.get("snippet", ""), max_length=220)
         url = result.get("url", "").strip()
         lines.append(f"{idx}. {title}")
         if snippet:
@@ -767,12 +1049,17 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
     if deterministic_reminder_response is not None:
         response_text = deterministic_reminder_response
     else:
+        explicit_web_request = _is_explicit_web_request(message)
         memory_context = ""
         if memory_manager:
             memory_context = await memory_manager.search_relevant_context(query=message, n=5)
             memory_context = _sanitize_memory_context(memory_context)
 
-        web_query, web_results, web_context = await _build_web_context(message)
+        web_query, web_results, web_context = await _build_web_context(
+            message,
+            history=history,
+            allow_web_search=explicit_web_request,
+        )
         combined_context = "\n\n".join(
             part for part in (memory_context.strip(), web_context.strip()) if part
         )
@@ -785,6 +1072,9 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
             memory_context=combined_context or None,
             active_reminders=active_reminders or None,
         )
+        channel_addendum = _channel_prompt_addendum(source)
+        if channel_addendum:
+            system_prompt = f"{system_prompt}\n\n{channel_addendum}"
 
         model_history = _sanitize_history_for_generation(history)
         response_text = await llm_engine.generate_response(
@@ -800,21 +1090,13 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
             or len(response_text.strip()) <= 8
             or "no pude generar una respuesta" in response_text.lower()
         ):
-            lines = [f"Encontre esto para: {web_query}"]
-            for idx, result in enumerate(web_results[:5], 1):
-                lines.append(f"{idx}. {result.get('title', '').strip()}")
-                snippet = result.get("snippet", "").strip()
-                if snippet:
-                    lines.append(f"   {snippet}")
-                url = result.get("url", "").strip()
-                if url:
-                    lines.append(f"   {url}")
-            response_text = "\n".join(lines)
+            response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
 
         # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
         # intentamos una busqueda directa con el mensaje completo.
         if (
             web_search_engine
+            and explicit_web_request
             and not web_results
             and (
                 not response_text.strip()
@@ -828,16 +1110,14 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
             if rescue_query:
                 rescue_results = await web_search_engine.search(rescue_query, max_results=5)
                 if rescue_results:
-                    lines = [f"Encontre esto para: {rescue_query}"]
-                    for idx, result in enumerate(rescue_results[:5], 1):
-                        lines.append(f"{idx}. {result.get('title', '').strip()}")
-                        snippet = result.get("snippet", "").strip()
-                        if snippet:
-                            lines.append(f"   {snippet}")
-                        url = result.get("url", "").strip()
-                        if url:
-                            lines.append(f"   {url}")
-                    response_text = "\n".join(lines)
+                    response_text = _format_web_results_for_user(
+                        rescue_query,
+                        rescue_results,
+                        max_results=5,
+                    )
+
+        if source == "telegram" and web_results:
+            response_text = _append_telegram_sources_block(response_text, web_results)
 
         # Reintento defensivo: cuando el modelo responde rechazo generico
         # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
