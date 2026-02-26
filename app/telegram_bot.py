@@ -8,9 +8,10 @@ import re
 from typing import Optional
 from html import unescape
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -19,6 +20,10 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID, logger
+
+# Prefijos para callback_data de películas (Fase 6/7)
+MOVIE_DOWNLOAD_PREFIX = "movie_dl:"
+MOVIE_CANCEL_PREFIX = "movie_cancel:"
 
 
 class TelegramBot:
@@ -31,6 +36,7 @@ class TelegramBot:
         reminder_manager=None,
         web_search=None,
         clear_history_handler=None,
+        media_handler=None,
     ):
         """
         Args:
@@ -39,12 +45,14 @@ class TelegramBot:
             reminder_manager: Instancia de ReminderManager (Fase 5)
             web_search: Instancia de WebSearchEngine (Fase 5)
             clear_history_handler: Funcion clear_history(user_id) -> bool
+            media_handler: Instancia de RadarrClient (Fase 6)
         """
         self.chat_handler = chat_handler
         self.memory = memory_manager
         self.reminders = reminder_manager
         self.web_search = web_search
         self.clear_history_handler = clear_history_handler
+        self.media = media_handler
         self.app: Optional[Application] = None
         self.allowed_user_id = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else None
 
@@ -329,6 +337,7 @@ class TelegramBot:
             "/reminders — Ver recordatorios activos\n"
             "/remind [texto] [fecha] — Crear recordatorio\n"
             "/search [consulta] — Buscar en internet\n"
+            "/movie [titulo] — Buscar y descargar pelicula\n"
             "/clear — Limpiar historial de chat",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -488,6 +497,192 @@ class TelegramBot:
             await update.message.reply_text("Sistema de busqueda no disponible.")
 
     # ==========================================
+    # FASE 6/7: BUSQUEDA DE PELICULAS (Radarr)
+    # ==========================================
+
+    async def cmd_movie(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Comando /movie — Buscar y descargar peliculas via Radarr."""
+        if not self._is_authorized(update):
+            return
+
+        query = " ".join(context.args) if context.args else ""
+        if not query:
+            await update.message.reply_text("Uso: /movie [titulo de la pelicula]")
+            return
+
+        await self._search_and_show_movie(update, query)
+
+    async def _search_and_show_movie(self, update: Update, query: str) -> None:
+        """Busca una pelicula en Radarr y muestra el primer resultado con poster y botones."""
+        if not self.media or not self.media.enabled:
+            await update.message.reply_text("Sistema de peliculas no disponible (Radarr no configurado).")
+            return
+
+        await update.message.chat.send_action(ChatAction.TYPING)
+
+        results = await self.media.search_movie(query)
+        if not results:
+            await update.message.reply_text(
+                f"No encontre resultados para: {query}\n"
+                "Intenta con otro titulo o verifica la ortografia."
+            )
+            return
+
+        movie = results[0]
+        title = movie.get("title", "Desconocido")
+        year = movie.get("year", "")
+        tmdb_id = movie.get("tmdbId", 0)
+        overview = movie.get("overview", "")
+        poster_url = movie.get("poster_url", "")
+        has_file = movie.get("hasFile", False)
+        is_existing = movie.get("isExisting", False)
+
+        # Construir caption
+        caption_parts = [f"{title} ({year})"]
+        if overview:
+            short_overview = overview[:250]
+            if len(overview) > 250:
+                short_overview += "..."
+            caption_parts.append(f"\n{short_overview}")
+        if has_file:
+            caption_parts.append("\nYa esta descargada en tu biblioteca.")
+        elif is_existing:
+            caption_parts.append("\nYa esta en Radarr, monitoreada.")
+
+        caption = "\n".join(caption_parts)
+
+        # Botones inline
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "Descargar",
+                    callback_data=f"{MOVIE_DOWNLOAD_PREFIX}{tmdb_id}:{title}:{year}",
+                ),
+                InlineKeyboardButton(
+                    "Cancelar",
+                    callback_data=f"{MOVIE_CANCEL_PREFIX}{tmdb_id}",
+                ),
+            ]
+        ])
+
+        try:
+            if poster_url:
+                await update.message.reply_photo(
+                    photo=poster_url,
+                    caption=caption,
+                    reply_markup=keyboard,
+                )
+            else:
+                await update.message.reply_text(
+                    text=caption,
+                    reply_markup=keyboard,
+                )
+        except Exception as exc:
+            logger.error(f"Error al enviar poster de pelicula: {exc}")
+            # Fallback: enviar solo texto si la imagen falla
+            await update.message.reply_text(
+                text=caption,
+                reply_markup=keyboard,
+            )
+
+    async def handle_movie_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Procesa los botones inline de confirmacion de peliculas."""
+        query = update.callback_query
+        if not query:
+            return
+
+        # Verificar autorizacion
+        user_id = query.from_user.id
+        if self.allowed_user_id and user_id != self.allowed_user_id:
+            await query.answer("No autorizado.", show_alert=True)
+            return
+
+        await query.answer()  # Quitar reloj de espera del boton
+        data = query.data or ""
+
+        if data.startswith(MOVIE_CANCEL_PREFIX):
+            await query.edit_message_caption(
+                caption="Busqueda cancelada."
+            ) if query.message.photo else await query.edit_message_text(
+                text="Busqueda cancelada."
+            )
+            return
+
+        if data.startswith(MOVIE_DOWNLOAD_PREFIX):
+            await self._handle_movie_download(query, data)
+            return
+
+    async def _handle_movie_download(self, query, data: str) -> None:
+        """Procesa la confirmacion de descarga de una pelicula (Fase 7)."""
+        if not self.media or not self.media.enabled:
+            msg = "Sistema de peliculas no disponible."
+            if query.message.photo:
+                await query.edit_message_caption(caption=msg)
+            else:
+                await query.edit_message_text(text=msg)
+            return
+
+        # Parsear callback_data: "movie_dl:{tmdbId}:{title}:{year}"
+        parts = data[len(MOVIE_DOWNLOAD_PREFIX):].split(":", 2)
+        if len(parts) < 2:
+            return
+
+        try:
+            tmdb_id = int(parts[0])
+        except ValueError:
+            return
+
+        title = parts[1] if len(parts) > 1 else "Pelicula"
+        year = 0
+        if len(parts) > 2:
+            try:
+                year = int(parts[2])
+            except ValueError:
+                pass
+
+        # Mensaje de progreso
+        progress_msg = f"Agregando {title} a Radarr..."
+        if query.message.photo:
+            await query.edit_message_caption(caption=progress_msg)
+        else:
+            await query.edit_message_text(text=progress_msg)
+
+        # Llamar a RadarrClient.add_movie
+        result = await self.media.add_movie(
+            tmdb_id=tmdb_id,
+            title=title,
+            year=year,
+        )
+
+        if result.get("error"):
+            error_msg = f"Error al agregar {title}:\n{result['error']}"
+            if query.message.photo:
+                await query.edit_message_caption(caption=error_msg)
+            else:
+                await query.edit_message_text(text=error_msg)
+            return
+
+        if result.get("already_exists"):
+            msg = (
+                f"{title} ({year})\n\n"
+                f"{result.get('message', 'Ya esta en tu biblioteca de Radarr.')}"
+            )
+        else:
+            msg = (
+                f"Agregada a la lista! Transmission ya esta descargandola "
+                f"mediante Prowlarr.\n\n"
+                f"{title} ({year})\n"
+                f"Te avisare cuando este en Jellyfin."
+            )
+
+        if query.message.photo:
+            await query.edit_message_caption(caption=msg)
+        else:
+            await query.edit_message_text(text=msg)
+
+        logger.info(f"Pelicula procesada via Telegram: {title} (tmdbId={tmdb_id})")
+
+    # ==========================================
     # MENSAJES DE TEXTO
     # ==========================================
 
@@ -505,6 +700,14 @@ class TelegramBot:
         await update.message.chat.send_action(ChatAction.TYPING)
 
         try:
+            # Fase 6: Detectar intención de película vía LLM
+            if self.media and self.media.enabled:
+                movie_title = await self._extract_movie_intent(user_message)
+                if movie_title:
+                    logger.info(f"Intencion de pelicula detectada: '{movie_title}'")
+                    await self._search_and_show_movie(update, movie_title)
+                    return
+
             # Usar el mismo flujo que /chat
             response = await self.chat_handler(
                 message=user_message,
@@ -525,6 +728,51 @@ class TelegramBot:
             await update.message.reply_text(
                 "Hubo un error procesando tu mensaje. Intenta de nuevo."
             )
+
+    async def _extract_movie_intent(self, message: str) -> Optional[str]:
+        """
+        Usa el LLM para detectar si el usuario quiere ver/descargar una pelicula.
+        Retorna el titulo extraido o None si no hay intencion de pelicula.
+        """
+        # Detección rápida por regex antes de llamar al LLM
+        movie_hint_re = re.compile(
+            r"\b(quiero\s+ver|descargar|descarga|baja|bajame|ponme|pon\s+la\s+peli|"
+            r"busca(?:me)?\s+la\s+peli|peli(?:cula)?|movie)\b",
+            flags=re.IGNORECASE,
+        )
+        if not movie_hint_re.search(message):
+            return None
+
+        # Usar el LLM solo para extraer el título
+        extraction_prompt = (
+            "Eres un extractor de intenciones. El usuario quiere ver o descargar una pelicula.\n"
+            "Extrae SOLO el titulo de la pelicula del mensaje.\n"
+            "Si NO hay intencion de pelicula, responde exactamente: NONE\n"
+            "Si hay titulo, responde SOLO con el titulo, sin comillas ni explicacion.\n\n"
+            "Ejemplos:\n"
+            "- 'Quiero ver Inception' -> Inception\n"
+            "- 'Descarga The Matrix' -> The Matrix\n"
+            "- 'Ponme la peli de Batman Begins' -> Batman Begins\n"
+            "- 'Que hora es?' -> NONE\n"
+            "- 'Bajame Interstellar' -> Interstellar\n"
+        )
+        try:
+            from app.llm_engine import OllamaEngine
+            # Usamos una instancia temporal ligera solo para extraccion
+            engine = OllamaEngine()
+            result = await engine.generate_response(
+                messages=[{"role": "user", "content": message}],
+                system_prompt=extraction_prompt,
+            )
+            await engine.close()
+
+            cleaned = (result or "").strip().strip('"').strip("'").strip()
+            if not cleaned or cleaned.upper() == "NONE" or len(cleaned) > 100:
+                return None
+            return cleaned
+        except Exception as exc:
+            logger.error(f"Error extrayendo intencion de pelicula: {exc}")
+            return None
 
     # ==========================================
     # INICIALIZACION Y EJECUCION
@@ -551,6 +799,12 @@ class TelegramBot:
             self.app.add_handler(CommandHandler("reminders", self.cmd_reminders))
             self.app.add_handler(CommandHandler("remind", self.cmd_remind))
             self.app.add_handler(CommandHandler("search", self.cmd_search))
+            self.app.add_handler(CommandHandler("movie", self.cmd_movie))
+
+            # Callback para botones inline (Fase 6/7 - peliculas)
+            self.app.add_handler(
+                CallbackQueryHandler(self.handle_movie_callback)
+            )
 
             # Mensajes de texto
             self.app.add_handler(
@@ -591,6 +845,7 @@ class TelegramBot:
                     BotCommand("reminders", "Ver recordatorios"),
                     BotCommand("remind", "Crear recordatorio"),
                     BotCommand("search", "Buscar en internet"),
+                    BotCommand("movie", "Buscar y descargar pelicula"),
                     BotCommand("clear", "Limpiar historial"),
                 ])
             except Exception:

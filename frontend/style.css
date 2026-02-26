@@ -181,7 +181,7 @@ body {
     padding: 16px 20px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
 }
 
 /* --- Mensajes --- */
@@ -202,10 +202,10 @@ body {
 }
 
 .bubble {
-    padding: 12px 16px;
+    padding: 14px 18px;
     border-radius: var(--radius);
     font-size: 15px;
-    line-height: 1.5;
+    line-height: 1.58;
     word-wrap: break-word;
     overflow-wrap: break-word;
     white-space: normal;
@@ -228,11 +228,11 @@ body {
 
 /* --- Markdown estilizado para respuestas del agente --- */
 .message.agent .bubble.markdown {
-    line-height: 1.58;
+    line-height: 1.66;
 }
 
 .message.agent .bubble.markdown > * + * {
-    margin-top: 13px;
+    margin-top: 18px;
 }
 
 .message.agent .bubble.markdown p {
@@ -255,8 +255,8 @@ body {
 
 .message.agent .bubble.markdown ul,
 .message.agent .bubble.markdown ol {
-    margin: 0;
-    padding-left: 22px;
+    margin: 2px 0;
+    padding-left: 24px;
 }
 
 .message.agent .bubble.markdown li {
@@ -264,12 +264,12 @@ body {
 }
 
 .message.agent .bubble.markdown li + li {
-    margin-top: 8px;
+    margin-top: 10px;
 }
 
 .message.agent .bubble.markdown blockquote {
     margin: 0;
-    padding: 12px 14px;
+    padding: 14px 16px;
     border-left: 3px solid var(--accent);
     background: rgba(10, 132, 255, 0.12);
     border-radius: 10px;
@@ -332,12 +332,12 @@ body {
     min-width: 300px;
     border-collapse: collapse;
     font-size: 13px;
-    line-height: 1.45;
+    line-height: 1.52;
 }
 
 .message.agent .bubble.markdown th,
 .message.agent .bubble.markdown td {
-    padding: 10px 12px;
+    padding: 12px 14px;
     text-align: left;
     border-bottom: 1px solid var(--border);
     vertical-align: top;
@@ -355,7 +355,7 @@ body {
 
 .message.agent .bubble.markdown .comparison-grid {
     display: grid;
-    gap: 12px;
+    gap: 14px;
     margin: 0;
 }
 
@@ -363,7 +363,7 @@ body {
     border: 1px solid var(--border);
     background: rgba(255, 255, 255, 0.02);
     border-radius: 12px;
-    padding: 12px 14px;
+    padding: 14px 16px;
 }
 
 .message.agent .bubble.markdown .comparison-card-header h4 {
@@ -389,7 +389,7 @@ body {
 }
 
 .message.agent .bubble.markdown .comparison-bullets li {
-    margin: 6px 0;
+    margin: 8px 0;
 }
 
 /* --- Indicador de escribiendo --- */

@@ -98,6 +98,17 @@ def build_system_prompt(
             "simple y compacta (sin viñetas dentro de celdas)."
         ),
         "No inventes datos: si falta contexto, dilo con claridad y pide precision.",
+        "",
+        "--- Capacidades multimedia (Fase 6/7) ---",
+        (
+            "Puedes buscar y descargar peliculas via Radarr. Si el usuario pide ver o "
+            "descargar una pelicula, el sistema se encarga automaticamente de buscarla, "
+            "mostrar el poster con botones de confirmacion, y gestionarla con Radarr/Prowlarr/Transmission."
+        ),
+        (
+            "No intentes comunicarte con APIs externas directamente. Solo extrae la intencion "
+            "y el titulo de la pelicula; el backend orquesta la comunicacion."
+        ),
     ]
 
     # Inyectar contexto de memoria (Fase 2 lo llenara)

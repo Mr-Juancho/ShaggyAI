@@ -46,6 +46,12 @@ except Exception as exc:
     TelegramBot = None  # type: ignore[assignment]
     logger.error(f"No se pudo cargar TelegramBot: {exc}")
 
+try:
+    from app.media_handler import RadarrClient
+except Exception as exc:
+    RadarrClient = None  # type: ignore[assignment]
+    logger.error(f"No se pudo cargar RadarrClient: {exc}")
+
 
 # --- Modelos Pydantic ---
 class ChatRequest(BaseModel):
@@ -104,6 +110,7 @@ class HealthResponse(BaseModel):
 
     status: str
     ollama: bool
+    radarr: Optional[bool] = None
 
 
 # --- Estado global ---
@@ -131,6 +138,13 @@ if WebSearchEngine is not None:
         web_search_engine = WebSearchEngine()
     except Exception as exc:
         logger.error(f"No se pudo inicializar WebSearchEngine: {exc}")
+
+radarr_client = None
+if RadarrClient is not None:
+    try:
+        radarr_client = RadarrClient()
+    except Exception as exc:
+        logger.error(f"No se pudo inicializar RadarrClient: {exc}")
 
 telegram_bot = None
 telegram_task: Optional[asyncio.Task] = None
@@ -1206,6 +1220,7 @@ async def lifespan(app: FastAPI):
                 reminder_manager=reminder_manager,
                 web_search=web_search_engine,
                 clear_history_handler=clear_user_history,
+                media_handler=radarr_client,
             )
             if reminder_manager and telegram_bot:
                 reminder_manager.telegram_send_fn = telegram_bot.send_message
@@ -1235,6 +1250,9 @@ async def lifespan(app: FastAPI):
             telegram_task.cancel()
             with suppress(asyncio.CancelledError):
                 await telegram_task
+
+        if radarr_client:
+            await radarr_client.close()
 
         await llm_engine.close()
         logger.info("Servidor detenido")
@@ -1338,11 +1356,58 @@ async def delete_reminder(reminder_id: str) -> ReminderDeleteResponse:
     return ReminderDeleteResponse(deleted=False, message="Recordatorio no encontrado.")
 
 
+# --- Fase 7: Webhook de Radarr ---
+@app.post("/webhook/radarr")
+async def radarr_webhook(payload: dict[str, Any]) -> dict[str, str]:
+    """
+    Recibe notificaciones de Radarr cuando una pelicula se descarga/importa.
+    Radarr envia webhooks con eventType: 'Download', 'MovieFileDelete', etc.
+    Configurar en Radarr: Settings > Connect > Webhook > URL: http://<host>:8000/webhook/radarr
+    """
+    event_type = payload.get("eventType", "Unknown")
+    logger.info(f"Webhook Radarr recibido: eventType={event_type}")
+
+    # Solo procesamos eventos de descarga/importacion completada
+    if event_type not in ("Download", "MovieAdded", "MovieFileDelete"):
+        logger.debug(f"Webhook Radarr ignorado: eventType={event_type}")
+        return {"status": "ignored", "eventType": event_type}
+
+    # Extraer titulo de la pelicula
+    movie_data = payload.get("movie", {})
+    title = movie_data.get("title", "Pelicula desconocida")
+    year = movie_data.get("year", "")
+
+    if event_type == "Download":
+        # Pelicula descargada e importada a la biblioteca
+        is_upgrade = payload.get("isUpgrade", False)
+        if is_upgrade:
+            message = f"La pelicula {title} ({year}) se ha actualizado a mejor calidad en Jellyfin!"
+        else:
+            message = f"La pelicula {title} ({year}) ya esta descargada y lista para ver en Jellyfin!"
+
+        # Enviar notificacion proactiva via Telegram
+        if telegram_bot:
+            sent = await telegram_bot.send_message(message)
+            if sent:
+                logger.info(f"Notificacion Telegram enviada: {title}")
+            else:
+                logger.warning(f"No se pudo enviar notificacion Telegram para: {title}")
+        else:
+            logger.warning("Bot de Telegram no disponible para notificacion de Radarr.")
+
+        return {"status": "notified", "title": title}
+
+    return {"status": "processed", "eventType": event_type}
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    """Verifica el estado del servidor y la conexion a Ollama."""
+    """Verifica el estado del servidor y la conexion a Ollama y Radarr."""
     ollama_ok = await llm_engine.check_health()
-    return HealthResponse(status="ok", ollama=ollama_ok)
+    radarr_ok = None
+    if radarr_client and radarr_client.enabled:
+        radarr_ok = await radarr_client.check_health()
+    return HealthResponse(status="ok", ollama=ollama_ok, radarr=radarr_ok)
 
 
 # --- Servir frontend ---

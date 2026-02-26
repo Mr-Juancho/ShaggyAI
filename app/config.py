@@ -55,6 +55,10 @@ TELEGRAM_USER_ID: str = os.getenv("TELEGRAM_USER_ID", "")
 # --- Web search ---
 BRAVE_API_KEY: str = os.getenv("BRAVE_API_KEY", "")
 
+# --- Radarr (Fase 6) ---
+RADARR_URL: str = os.getenv("RADARR_URL", "http://localhost:7878")
+RADARR_API_KEY: str = os.getenv("RADARR_API_KEY", "")
+
 # --- Servidor ---
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8000"))
