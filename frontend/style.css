@@ -392,6 +392,201 @@ body {
     margin: 8px 0;
 }
 
+/* --- Tarjeta de película (Fase 6.5) --- */
+.movie-card {
+    background: var(--bubble-agent);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    max-width: 360px;
+    box-shadow: var(--shadow);
+}
+
+.movie-poster {
+    width: 100%;
+    height: auto;
+    display: block;
+    max-height: 420px;
+    object-fit: cover;
+}
+
+.movie-info {
+    padding: 14px 16px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.movie-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.2px;
+}
+
+.movie-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.movie-meta-row {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 13px;
+    line-height: 1.35;
+}
+
+.movie-meta-label {
+    min-width: 62px;
+    color: var(--text-secondary);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    font-size: 11px;
+}
+
+.movie-meta-value {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.movie-summary {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    padding-top: 2px;
+}
+
+.movie-actions {
+    margin-top: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.movie-btn {
+    width: 100%;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    font-family: inherit;
+}
+
+.movie-btn-download {
+    background: var(--accent);
+    color: #fff;
+}
+
+.movie-btn-download:hover {
+    background: var(--accent-hover);
+}
+
+.movie-btn-cancel {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+}
+
+.movie-btn-cancel:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+/* Release options */
+.release-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.release-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    font-family: inherit;
+    text-align: left;
+}
+
+.release-btn:hover {
+    background: var(--bg-secondary);
+    border-color: var(--accent);
+}
+
+.release-btn:active {
+    transform: scale(0.98);
+}
+
+.release-quality {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    min-width: 48px;
+}
+
+.release-size {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent);
+}
+
+.release-meta {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-left: auto;
+    white-space: nowrap;
+}
+
+.release-btn-cancel {
+    justify-content: center;
+    color: var(--text-secondary);
+    font-size: 13px;
+    border: none;
+    padding: 8px;
+}
+
+.release-btn-cancel:hover {
+    color: var(--text-primary);
+    background: transparent;
+    border: none;
+}
+
+/* Movie status messages */
+.movie-loading {
+    font-size: 13px;
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 8px 0;
+}
+
+.movie-status {
+    font-size: 13px;
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 8px 0;
+    line-height: 1.5;
+}
+
+.movie-status.movie-success {
+    color: #34C759;
+}
+
+.movie-status.movie-error {
+    color: #FF3B30;
+}
+
 /* --- Indicador de escribiendo --- */
 .typing-indicator {
     display: flex;

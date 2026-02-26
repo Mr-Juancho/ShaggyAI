@@ -4,10 +4,12 @@ Comparte backend y memoria con la interfaz desktop.
 """
 
 import asyncio
+import io
 import re
 from typing import Optional
 from html import unescape
 
+import httpx
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -534,23 +536,50 @@ class TelegramBot:
         title = movie.get("title", "Desconocido")
         year = movie.get("year", "")
         tmdb_id = movie.get("tmdbId", 0)
-        overview = movie.get("overview", "")
+        overview = (movie.get("overview") or "").strip()
+        summary = (movie.get("summary") or overview or "Sin resumen disponible.").strip()
+        if len(summary) > 180:
+            summary = f"{summary[:180].rstrip()}..."
         poster_url = movie.get("poster_url", "")
         has_file = movie.get("hasFile", False)
         is_existing = movie.get("isExisting", False)
 
-        # Construir caption
-        caption_parts = [f"{title} ({year})"]
-        if overview:
-            short_overview = overview[:250]
-            if len(overview) > 250:
-                short_overview += "..."
-            caption_parts.append(f"\n{short_overview}")
-        if has_file:
-            caption_parts.append("\nYa esta descargada en tu biblioteca.")
-        elif is_existing:
-            caption_parts.append("\nYa esta en Radarr, monitoreada.")
+        raw_genres = movie.get("genres")
+        if isinstance(raw_genres, list):
+            genres = [str(g).strip() for g in raw_genres if str(g).strip()]
+            genre_text = ", ".join(genres[:3]) if genres else ""
+        else:
+            genre_text = ""
+        if not genre_text:
+            genre_text = str(movie.get("genre_text") or "No especificado")
 
+        runtime_text = str(movie.get("runtime_text") or "").strip()
+        if not runtime_text:
+            runtime_minutes = movie.get("runtime_minutes")
+            if isinstance(runtime_minutes, int) and runtime_minutes > 0:
+                h, m = divmod(runtime_minutes, 60)
+                if h and m:
+                    runtime_text = f"{h}h {m}min"
+                elif h:
+                    runtime_text = f"{h}h"
+                else:
+                    runtime_text = f"{m}min"
+            else:
+                runtime_text = "No especificada"
+
+        # Construir caption con el orden solicitado:
+        # imagen (reply_photo) -> titulo -> genero -> duracion -> resumen corto
+        title_line = f"{title} ({year})" if year else title
+        caption_parts = [
+            title_line,
+            f"Genero: {genre_text}",
+            f"Duracion: {runtime_text}",
+            f"Resumen: {summary}",
+        ]
+        if has_file:
+            caption_parts.append("Estado: Ya esta descargada en tu biblioteca.")
+        elif is_existing:
+            caption_parts.append("Estado: Ya esta en Radarr, monitoreada.")
         caption = "\n".join(caption_parts)
 
         # Botones inline
@@ -580,12 +609,25 @@ class TelegramBot:
                     reply_markup=keyboard,
                 )
         except Exception as exc:
-            logger.error(f"Error al enviar poster de pelicula: {exc}")
-            # Fallback: enviar solo texto si la imagen falla
-            await update.message.reply_text(
-                text=caption,
-                reply_markup=keyboard,
-            )
+            logger.warning(f"Error al enviar poster por URL directa: {exc}")
+            if poster_url:
+                try:
+                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                        image_resp = await client.get(poster_url)
+                        image_resp.raise_for_status()
+                    image_bytes = io.BytesIO(image_resp.content)
+                    image_bytes.name = "poster.jpg"
+                    await update.message.reply_photo(
+                        photo=image_bytes,
+                        caption=caption,
+                        reply_markup=keyboard,
+                    )
+                    return
+                except Exception as fallback_exc:
+                    logger.error(f"Error enviando poster por fallback binario: {fallback_exc}")
+
+            # Fallback final: enviar solo texto si la imagen falla
+            await update.message.reply_text(text=caption, reply_markup=keyboard)
 
     async def handle_movie_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Procesa los botones inline de confirmacion de peliculas y releases."""
@@ -930,6 +972,8 @@ class TelegramBot:
         if not movie_hint_re.search(message):
             return None
 
+        heuristic_title = self._extract_movie_title_heuristic(message)
+
         # Usar el LLM solo para extraer el título
         extraction_prompt = (
             "Eres un extractor de intenciones. El usuario quiere ver o descargar una pelicula.\n"
@@ -954,12 +998,49 @@ class TelegramBot:
             await engine.close()
 
             cleaned = (result or "").strip().strip('"').strip("'").strip()
-            if not cleaned or cleaned.upper() == "NONE" or len(cleaned) > 100:
-                return None
-            return cleaned
+            if cleaned and cleaned.upper() != "NONE" and len(cleaned) <= 100:
+                return cleaned
+            return heuristic_title
         except Exception as exc:
             logger.error(f"Error extrayendo intencion de pelicula: {exc}")
+            return heuristic_title
+
+    def _extract_movie_title_heuristic(self, message: str) -> Optional[str]:
+        """Fallback simple para extraer título sin depender del LLM."""
+        text = (message or "").strip()
+        if not text:
             return None
+
+        quoted = re.search(r"[\"“”'‘’]([^\"“”'‘’]{2,100})[\"“”'‘’]", text)
+        if quoted:
+            candidate = quoted.group(1).strip()
+            if candidate:
+                return candidate
+
+        pattern = re.compile(
+            r"(?:quiero\s+ver|ver|descarga(?:r)?|baja(?:me)?|"
+            r"pon(?:me)?(?:\s+la\s+peli(?:cula)?)?|"
+            r"busca(?:me)?(?:\s+la\s+peli(?:cula)?)?|movie)\s+(.+)$",
+            flags=re.IGNORECASE,
+        )
+        match = pattern.search(text)
+        if not match:
+            return None
+
+        candidate = match.group(1).strip()
+        candidate = re.sub(
+            r"^(la|el|una|un)\s+(pel[ií]cula|movie)\s+(de\s+)?",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        candidate = re.sub(r"^de\s+", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\b(por\s+favor|pls|please)\b", "", candidate, flags=re.IGNORECASE)
+        candidate = candidate.strip(" \t\n\r.,!?¿¡:;\"'()[]{}")
+
+        if not candidate or len(candidate) > 100:
+            return None
+        return candidate
 
     # ==========================================
     # INICIALIZACION Y EJECUCION

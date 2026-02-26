@@ -66,6 +66,7 @@ class ChatResponse(BaseModel):
     """Modelo de response para el endpoint /chat."""
 
     response: str
+    movie: Optional[dict[str, Any]] = None  # Datos de película (Fase 6.5)
 
 
 class RememberRequest(BaseModel):
@@ -1268,15 +1269,177 @@ app = FastAPI(
 
 
 # --- Endpoints ---
+# --- Regex para detección de intención de película en web ---
+_MOVIE_HINT_WEB_RE = re.compile(
+    r"\b(quiero\s+ver|descargar|descarga|baja|bajame|ponme|pon\s+la\s+peli|"
+    r"busca(?:me)?\s+la\s+peli|peli(?:cula)?|movie)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_movie_title_heuristic(message: str) -> Optional[str]:
+    """Extrae título con reglas simples cuando el extractor LLM falla."""
+    text = (message or "").strip()
+    if not text:
+        return None
+
+    quoted = re.search(r"[\"“”'‘’]([^\"“”'‘’]{2,100})[\"“”'‘’]", text)
+    if quoted:
+        candidate = quoted.group(1).strip()
+        if candidate:
+            return candidate
+
+    pattern = re.compile(
+        r"(?:quiero\s+ver|ver|descarga(?:r)?|baja(?:me)?|"
+        r"pon(?:me)?(?:\s+la\s+peli(?:cula)?)?|"
+        r"busca(?:me)?(?:\s+la\s+peli(?:cula)?)?|movie)\s+(.+)$",
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(text)
+    if not match:
+        return None
+
+    candidate = match.group(1).strip()
+    candidate = re.sub(
+        r"^(la|el|una|un)\s+(pel[ií]cula|movie)\s+(de\s+)?",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r"^de\s+", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\b(por\s+favor|pls|please)\b", "", candidate, flags=re.IGNORECASE)
+    candidate = candidate.strip(" \t\n\r.,!?¿¡:;\"'()[]{}")
+
+    if not candidate or len(candidate) > 100:
+        return None
+    return candidate
+
+
+async def _extract_movie_title(message: str) -> Optional[str]:
+    """Usa el LLM para extraer título de película del mensaje del usuario."""
+    if not _MOVIE_HINT_WEB_RE.search(message):
+        return None
+
+    heuristic_title = _extract_movie_title_heuristic(message)
+
+    extraction_prompt = (
+        "Eres un extractor de intenciones. El usuario quiere ver o descargar una pelicula.\n"
+        "Extrae SOLO el titulo de la pelicula del mensaje.\n"
+        "Si NO hay intencion de pelicula, responde exactamente: NONE\n"
+        "Si hay titulo, responde SOLO con el titulo, sin comillas ni explicacion.\n\n"
+        "Ejemplos:\n"
+        "- 'Quiero ver Inception' -> Inception\n"
+        "- 'Descarga The Matrix' -> The Matrix\n"
+        "- 'Ponme la peli de Batman Begins' -> Batman Begins\n"
+        "- 'Que hora es?' -> NONE\n"
+        "- 'Bajame Interstellar' -> Interstellar\n"
+    )
+    try:
+        result = await llm_engine.generate_response(
+            messages=[{"role": "user", "content": message}],
+            system_prompt=extraction_prompt,
+        )
+        cleaned = (result or "").strip().strip('"').strip("'").strip()
+        if cleaned and cleaned.upper() != "NONE" and len(cleaned) <= 100:
+            return cleaned
+        return heuristic_title
+    except Exception as exc:
+        logger.error(f"Error extrayendo título de película: {exc}")
+        return heuristic_title
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """Endpoint principal de chat."""
+
+    # Detectar intención de película para fuentes web/desktop
+    if radarr_client and radarr_client.enabled and request.source in ("desktop", "api"):
+        movie_title = await _extract_movie_title(request.message)
+        if movie_title:
+            logger.info(f"[{request.source}] Intención de película detectada: '{movie_title}'")
+            results = await radarr_client.search_movie(movie_title)
+            if results:
+                movie = results[0]
+                return ChatResponse(
+                    response=f"Encontré esta película: **{movie['title']}** ({movie['year']})",
+                    movie=movie,
+                )
+
     response_text = await process_chat_message(
         message=request.message,
         user_id=request.user_id,
         source=request.source,
     )
     return ChatResponse(response=response_text)
+
+
+# --- Endpoints de películas (Fase 6.5 web) ---
+
+class MovieReleasesRequest(BaseModel):
+    tmdb_id: int
+    title: str = ""
+    year: int = 0
+
+
+class MovieGrabRequest(BaseModel):
+    guid: str
+    indexer_id: int
+
+
+@app.post("/movie/add-and-releases")
+async def movie_add_and_releases(request: MovieReleasesRequest) -> dict[str, Any]:
+    """Añade película a Radarr y busca releases disponibles."""
+    if not radarr_client or not radarr_client.enabled:
+        raise HTTPException(status_code=503, detail="Radarr no configurado.")
+
+    # 1) Añadir a Radarr sin búsqueda automática
+    result = await radarr_client.add_movie(
+        tmdb_id=request.tmdb_id,
+        title=request.title,
+        year=request.year,
+        search_for_movie=False,
+    )
+
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    # 2) Obtener ID interno de Radarr
+    radarr_id = result.get("radarr_id")
+    if not radarr_id:
+        existing = await radarr_client.get_movie_by_tmdb(request.tmdb_id)
+        if existing:
+            radarr_id = existing.get("id")
+
+    if not radarr_id:
+        return {"releases": [], "message": "Película añadida pero no se encontró su ID en Radarr."}
+
+    # 3) Buscar releases
+    releases = await radarr_client.search_releases(radarr_id)
+    grouped = radarr_client.get_grouped_releases(releases)
+
+    return {
+        "radarr_id": radarr_id,
+        "releases": grouped,
+        "total_found": len(releases),
+        "approved": len([r for r in releases if not r.get("rejected")]),
+    }
+
+
+@app.post("/movie/grab")
+async def movie_grab(request: MovieGrabRequest) -> dict[str, Any]:
+    """Descarga un release específico."""
+    if not radarr_client or not radarr_client.enabled:
+        raise HTTPException(status_code=503, detail="Radarr no configurado.")
+
+    result = await radarr_client.grab_release(
+        guid=request.guid,
+        indexer_id=request.indexer_id,
+    )
+
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    return result
 
 
 @app.post("/remember", response_model=RememberResponse)

@@ -20,6 +20,7 @@ const SOURCE = 'desktop';
 
 // --- Estado ---
 let isWaiting = false;
+let pendingReleases = {}; // Cache de releases por guid
 
 // ==========================================
 // FUNCIONES PRINCIPALES
@@ -73,8 +74,13 @@ async function sendMessage() {
         // Quitar indicador de escribiendo
         removeTypingIndicator(typingEl);
 
-        // Mostrar respuesta del agente
-        appendMessage(data.response, 'agent');
+        // Si hay datos de película, mostrar tarjeta de película
+        if (data.movie) {
+            appendMovieCard(data.movie);
+        } else {
+            // Mostrar respuesta del agente
+            appendMessage(data.response, 'agent');
+        }
 
     } catch (error) {
         console.error('Error al enviar mensaje:', error);
@@ -614,6 +620,242 @@ function formatText(text) {
     }
 
     return rendered;
+}
+
+// ==========================================
+// PELICULAS — Fase 6.5 Web
+// ==========================================
+
+/**
+ * Muestra una tarjeta de pelicula con poster y botones
+ */
+function appendMovieCard(movie) {
+    const messageDiv = document.createElement('div');
+    messageDiv.className = 'message agent';
+
+    const card = document.createElement('div');
+    card.className = 'movie-card';
+
+    const posterUrl = typeof movie.poster_url === 'string' ? movie.poster_url.trim() : '';
+    const title = (movie.title || 'Desconocido').toString();
+    const year = movie.year || '';
+    const tmdbId = Number(movie.tmdbId || 0);
+    const genreText = Array.isArray(movie.genres) && movie.genres.length
+        ? movie.genres.filter(Boolean).join(', ')
+        : (movie.genre_text || 'No especificado');
+    const runtimeText = movie.runtime_text
+        || (Number(movie.runtime_minutes) > 0
+            ? `${Math.floor(Number(movie.runtime_minutes) / 60) > 0 ? `${Math.floor(Number(movie.runtime_minutes) / 60)}h ` : ''}${Number(movie.runtime_minutes) % 60}min`.trim()
+            : 'No especificada');
+    const rawSummary = (movie.summary || movie.overview || 'Sin resumen disponible.').toString();
+    const summary = rawSummary.length > 170 ? `${rawSummary.slice(0, 170).trim()}...` : rawSummary;
+
+    if (posterUrl) {
+        const poster = document.createElement('img');
+        poster.className = 'movie-poster';
+        poster.src = posterUrl;
+        poster.alt = `Poster de ${title}`;
+        poster.loading = 'lazy';
+        poster.referrerPolicy = 'no-referrer';
+        poster.onerror = () => poster.remove();
+        card.appendChild(poster);
+    }
+
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'movie-info';
+
+    const titleDiv = document.createElement('div');
+    titleDiv.className = 'movie-title';
+    titleDiv.textContent = year ? `${title} (${year})` : title;
+    infoDiv.appendChild(titleDiv);
+
+    const metaDiv = document.createElement('div');
+    metaDiv.className = 'movie-meta';
+
+    const genreRow = document.createElement('div');
+    genreRow.className = 'movie-meta-row';
+    genreRow.innerHTML = `<span class="movie-meta-label">Genero</span><span class="movie-meta-value">${escapeHtml(genreText)}</span>`;
+    metaDiv.appendChild(genreRow);
+
+    const runtimeRow = document.createElement('div');
+    runtimeRow.className = 'movie-meta-row';
+    runtimeRow.innerHTML = `<span class="movie-meta-label">Duracion</span><span class="movie-meta-value">${escapeHtml(runtimeText)}</span>`;
+    metaDiv.appendChild(runtimeRow);
+
+    infoDiv.appendChild(metaDiv);
+
+    const summaryDiv = document.createElement('div');
+    summaryDiv.className = 'movie-summary';
+    summaryDiv.textContent = summary;
+    infoDiv.appendChild(summaryDiv);
+
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'movie-actions';
+
+    const downloadBtn = document.createElement('button');
+    downloadBtn.className = 'movie-btn movie-btn-download';
+    downloadBtn.dataset.tmdb = String(tmdbId);
+    downloadBtn.dataset.title = title;
+    downloadBtn.dataset.year = String(year || 0);
+    downloadBtn.textContent = 'Descargar';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'movie-btn movie-btn-cancel';
+    cancelBtn.textContent = 'Cancelar';
+
+    actionsDiv.appendChild(downloadBtn);
+    actionsDiv.appendChild(cancelBtn);
+    infoDiv.appendChild(actionsDiv);
+    card.appendChild(infoDiv);
+
+    // Event: Descargar
+    downloadBtn.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const actionsDiv = card.querySelector('.movie-actions');
+        actionsDiv.innerHTML = '<div class="movie-loading">Buscando opciones de descarga...</div>';
+        await fetchReleases(card, parseInt(btn.dataset.tmdb), btn.dataset.title, btn.dataset.year);
+    });
+
+    // Event: Cancelar
+    cancelBtn.addEventListener('click', () => {
+        card.querySelector('.movie-actions').innerHTML = '<div class="movie-status">Busqueda cancelada.</div>';
+    });
+
+    messageDiv.appendChild(card);
+    chatMessages.appendChild(messageDiv);
+    scrollToBottom();
+}
+
+/**
+ * Busca releases disponibles y muestra opciones de calidad
+ */
+async function fetchReleases(card, tmdbId, title, year) {
+    try {
+        const resp = await fetch('/movie/add-and-releases', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tmdb_id: tmdbId, title, year: parseInt(year) || 0 }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.detail || `Error ${resp.status}`);
+        }
+
+        const data = await resp.json();
+        const releases = data.releases || [];
+
+        const actionsDiv = card.querySelector('.movie-actions') || card.querySelector('.movie-info');
+
+        if (releases.length === 0) {
+            actionsDiv.innerHTML = `
+                <div class="movie-status">
+                    No se encontraron releases disponibles.
+                    <br>La pelicula queda monitoreada en Radarr.
+                </div>
+            `;
+            return;
+        }
+
+        renderReleaseOptions(card, releases, title, year);
+
+    } catch (err) {
+        console.error('Error buscando releases:', err);
+        const actionsDiv = card.querySelector('.movie-actions') || card.querySelector('.movie-info');
+        actionsDiv.innerHTML = `<div class="movie-status movie-error">Error: ${err.message}</div>`;
+    }
+}
+
+/**
+ * Renderiza las opciones de calidad como botones minimalistas
+ */
+function renderReleaseOptions(card, releases, title, year) {
+    const actionsDiv = card.querySelector('.movie-actions') || card.querySelector('.movie-info');
+
+    let html = '<div class="release-options">';
+
+    releases.slice(0, 6).forEach((rel, idx) => {
+        const cat = rel.quality_category || rel.quality || '?';
+        const size = rel.size_formatted || '?';
+        const seeders = rel.seeders || 0;
+        const langs = (rel.languages || []).join(', ') || '?';
+        const protocol = (rel.protocol || '').toUpperCase();
+        const indexer = rel.indexer || '?';
+        const key = `rel_${idx}_${Date.now()}`;
+
+        // Guardar en cache
+        pendingReleases[key] = {
+            guid: rel.guid,
+            indexerId: rel.indexerId,
+            title, year, quality: cat, size,
+        };
+
+        html += `
+            <button class="release-btn" data-key="${key}">
+                <span class="release-quality">${cat}</span>
+                <span class="release-size">${size}</span>
+                <span class="release-meta">${seeders} seeds · ${protocol} · ${langs}</span>
+            </button>
+        `;
+    });
+
+    html += '<button class="release-btn release-btn-cancel">Cancelar</button>';
+    html += '</div>';
+
+    actionsDiv.innerHTML = html;
+
+    // Events para cada release
+    actionsDiv.querySelectorAll('.release-btn[data-key]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const key = btn.dataset.key;
+            const info = pendingReleases[key];
+            if (!info) return;
+
+            actionsDiv.innerHTML = `<div class="movie-loading">Descargando ${info.quality} (${info.size})...</div>`;
+            await grabRelease(card, info);
+        });
+    });
+
+    // Event cancelar
+    const cancelBtn = actionsDiv.querySelector('.release-btn-cancel');
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', () => {
+            actionsDiv.innerHTML = '<div class="movie-status">Descarga cancelada.</div>';
+        });
+    }
+
+    scrollToBottom();
+}
+
+/**
+ * Graba (descarga) un release especifico
+ */
+async function grabRelease(card, info) {
+    const actionsDiv = card.querySelector('.movie-actions') || card.querySelector('.movie-info');
+
+    try {
+        const resp = await fetch('/movie/grab', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ guid: info.guid, indexer_id: info.indexerId }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.detail || `Error ${resp.status}`);
+        }
+
+        actionsDiv.innerHTML = `
+            <div class="movie-status movie-success">
+                Descarga iniciada!<br>
+                ${info.title} (${info.year}) · ${info.quality} (${info.size})<br>
+                Transmission ya esta descargandola.
+            </div>
+        `;
+    } catch (err) {
+        console.error('Error grabando release:', err);
+        actionsDiv.innerHTML = `<div class="movie-status movie-error">Error: ${err.message}</div>`;
+    }
 }
 
 // ==========================================

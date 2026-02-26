@@ -6,6 +6,7 @@ Fase 6.5: Selección de calidad (4K, 1080p, etc.) antes de descargar.
 """
 
 import httpx
+import re
 from typing import Any, Optional
 
 from app.config import RADARR_URL, RADARR_API_KEY, logger
@@ -34,6 +35,81 @@ def _classify_quality(quality_name: str) -> str:
     if any(tag in q for tag in ("480", "sd", "dvd")):
         return "480p"
     return quality_name
+
+
+def _extract_genres(raw_genres: Any) -> list[str]:
+    """Normaliza el campo de géneros de Radarr en lista de texto."""
+    if not raw_genres:
+        return []
+
+    genres: list[str] = []
+    if isinstance(raw_genres, list):
+        for entry in raw_genres:
+            name = ""
+            if isinstance(entry, str):
+                name = entry.strip()
+            elif isinstance(entry, dict):
+                name = str(
+                    entry.get("name")
+                    or entry.get("label")
+                    or entry.get("value")
+                    or ""
+                ).strip()
+            if name and name not in genres:
+                genres.append(name)
+    elif isinstance(raw_genres, str):
+        parts = [part.strip() for part in raw_genres.split(",")]
+        genres = [part for part in parts if part]
+
+    return genres[:4]
+
+
+def _extract_runtime_minutes(item: dict[str, Any]) -> Optional[int]:
+    """Extrae runtime en minutos desde posibles variantes de payload."""
+    for key in ("runtime", "runtimeMinutes", "duration", "durationMinutes"):
+        value = item.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw.isdigit():
+                minutes = int(raw)
+                if minutes > 0:
+                    return minutes
+
+            # Acepta formatos como "2h 34m", "2h", "154m"
+            match = re.match(r"^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m(?:in)?)?$", raw)
+            if match:
+                hours = int(match.group(1) or 0)
+                mins = int(match.group(2) or 0)
+                total = (hours * 60) + mins
+                if total > 0:
+                    return total
+
+    return None
+
+
+def _format_runtime(minutes: Optional[int]) -> str:
+    """Devuelve duración legible para UI/Telegram."""
+    if not minutes or minutes <= 0:
+        return "No especificada"
+
+    hours, mins = divmod(minutes, 60)
+    if hours and mins:
+        return f"{hours}h {mins}min"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}min"
+
+
+def _short_summary(text: str, max_len: int = 170) -> str:
+    """Resume overview en una línea corta para tarjetas/captions."""
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return "Sin resumen disponible."
+    if len(cleaned) <= max_len:
+        return cleaned
+    return f"{cleaned[:max_len].rstrip()}..."
 
 
 class RadarrClient:
@@ -117,24 +193,58 @@ class RadarrClient:
 
         movies: list[dict[str, Any]] = []
         for item in raw_results[:5]:
-            # Extraer la URL del póster remoto
+            # Extraer URL de poster con fallback robusto.
             poster_url = ""
-            remote_poster = item.get("remotePoster", "")
-            if remote_poster:
-                poster_url = remote_poster
-            else:
+            poster_candidates = [
+                item.get("remotePoster", ""),
+                item.get("remotePosterUrl", ""),
+                item.get("posterUrl", ""),
+                item.get("poster", ""),
+            ]
+            for candidate in poster_candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    poster_url = candidate.strip()
+                    break
+
+            if poster_url.startswith("/"):
+                poster_url = f"{self.base_url}{poster_url}"
+
+            if not poster_url:
                 # Fallback: buscar en images[]
                 for img in item.get("images", []):
-                    if img.get("coverType") == "poster" and img.get("remoteUrl"):
-                        poster_url = img["remoteUrl"]
+                    if img.get("coverType") != "poster":
+                        continue
+                    candidate = img.get("remoteUrl") or img.get("url") or ""
+                    if not candidate:
+                        continue
+                    if isinstance(candidate, str) and candidate.startswith("/"):
+                        candidate = f"{self.base_url}{candidate}"
+                    poster_url = candidate
+                    if poster_url:
                         break
+
+            # Fallback final: construir URL pública de TMDB si existe posterPath.
+            if not poster_url:
+                poster_path = item.get("posterPath") or item.get("remotePosterPath")
+                if isinstance(poster_path, str) and poster_path.startswith("/"):
+                    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+
+            genres = _extract_genres(item.get("genres"))
+            runtime_minutes = _extract_runtime_minutes(item)
+            overview = (item.get("overview") or "").strip()
+            summary = _short_summary(overview)
 
             movies.append({
                 "title": item.get("title", "Desconocido"),
                 "year": item.get("year", 0),
                 "tmdbId": item.get("tmdbId", 0),
-                "overview": (item.get("overview") or "")[:300],
+                "overview": overview[:400],
+                "summary": summary,
                 "poster_url": poster_url,
+                "genres": genres,
+                "genre_text": ", ".join(genres) if genres else "No especificado",
+                "runtime_minutes": runtime_minutes,
+                "runtime_text": _format_runtime(runtime_minutes),
                 "hasFile": item.get("hasFile", False),
                 "isExisting": item.get("id", 0) > 0,
             })
