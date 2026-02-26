@@ -21,9 +21,11 @@ from telegram.constants import ParseMode, ChatAction
 
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID, logger
 
-# Prefijos para callback_data de películas (Fase 6/7)
+# Prefijos para callback_data de películas (Fase 6/7/6.5)
 MOVIE_DOWNLOAD_PREFIX = "movie_dl:"
 MOVIE_CANCEL_PREFIX = "movie_cancel:"
+RELEASE_GRAB_PREFIX = "rel_grab:"
+RELEASE_CANCEL_PREFIX = "rel_cancel:"
 
 
 class TelegramBot:
@@ -586,7 +588,7 @@ class TelegramBot:
             )
 
     async def handle_movie_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Procesa los botones inline de confirmacion de peliculas."""
+        """Procesa los botones inline de confirmacion de peliculas y releases."""
         query = update.callback_query
         if not query:
             return
@@ -600,6 +602,7 @@ class TelegramBot:
         await query.answer()  # Quitar reloj de espera del boton
         data = query.data or ""
 
+        # Cancelar búsqueda de película
         if data.startswith(MOVIE_CANCEL_PREFIX):
             await query.edit_message_caption(
                 caption="Busqueda cancelada."
@@ -608,12 +611,29 @@ class TelegramBot:
             )
             return
 
+        # Cancelar selección de release
+        if data.startswith(RELEASE_CANCEL_PREFIX):
+            if query.message.photo:
+                await query.edit_message_caption(caption="Descarga cancelada.")
+            else:
+                await query.edit_message_text(text="Descarga cancelada.")
+            return
+
+        # Buscar releases (paso intermedio antes de descargar)
         if data.startswith(MOVIE_DOWNLOAD_PREFIX):
             await self._handle_movie_download(query, data)
             return
 
+        # Grabar un release específico seleccionado por el usuario
+        if data.startswith(RELEASE_GRAB_PREFIX):
+            await self._handle_release_grab(query, data)
+            return
+
     async def _handle_movie_download(self, query, data: str) -> None:
-        """Procesa la confirmacion de descarga de una pelicula (Fase 7)."""
+        """
+        Procesa la confirmacion de descarga: añade a Radarr, busca releases
+        disponibles y muestra opciones de calidad al usuario (Fase 6.5/7).
+        """
         if not self.media or not self.media.enabled:
             msg = "Sistema de peliculas no disponible."
             if query.message.photo:
@@ -640,18 +660,19 @@ class TelegramBot:
             except ValueError:
                 pass
 
-        # Mensaje de progreso
-        progress_msg = f"Agregando {title} a Radarr..."
+        # 1) Mensaje de progreso
+        progress_msg = f"Buscando opciones de descarga para {title}..."
         if query.message.photo:
             await query.edit_message_caption(caption=progress_msg)
         else:
             await query.edit_message_text(text=progress_msg)
 
-        # Llamar a RadarrClient.add_movie
+        # 2) Añadir película a Radarr SIN busqueda automática
         result = await self.media.add_movie(
             tmdb_id=tmdb_id,
             title=title,
             year=year,
+            search_for_movie=False,
         )
 
         if result.get("error"):
@@ -662,25 +683,191 @@ class TelegramBot:
                 await query.edit_message_text(text=error_msg)
             return
 
-        if result.get("already_exists"):
+        # 3) Obtener el ID interno de Radarr
+        radarr_id = result.get("radarr_id")
+        if not radarr_id:
+            # Si ya existía, buscar por tmdbId
+            existing = await self.media.get_movie_by_tmdb(tmdb_id)
+            if existing:
+                radarr_id = existing.get("id")
+
+        if not radarr_id:
+            msg = f"No pude obtener el ID de {title} en Radarr."
+            if query.message.photo:
+                await query.edit_message_caption(caption=msg)
+            else:
+                await query.edit_message_text(text=msg)
+            return
+
+        # 4) Buscar releases disponibles (esto consulta Prowlarr)
+        releases = await self.media.search_releases(radarr_id)
+
+        if not releases:
             msg = (
                 f"{title} ({year})\n\n"
-                f"{result.get('message', 'Ya esta en tu biblioteca de Radarr.')}"
+                "No se encontraron releases disponibles en este momento.\n"
+                "La pelicula queda monitoreada en Radarr y se descargara "
+                "automaticamente cuando aparezca un release."
             )
-        else:
+            if query.message.photo:
+                await query.edit_message_caption(caption=msg)
+            else:
+                await query.edit_message_text(text=msg)
+            return
+
+        # 5) Agrupar por calidad y seleccionar el mejor de cada categoría
+        grouped = self.media.get_grouped_releases(releases)
+
+        if not grouped:
+            # Todos los releases están rechazados por los filtros de Radarr
             msg = (
-                f"Agregada a la lista! Transmission ya esta descargandola "
-                f"mediante Prowlarr.\n\n"
-                f"{title} ({year})\n"
-                f"Te avisare cuando este en Jellyfin."
+                f"{title} ({year})\n\n"
+                "Se encontraron releases pero todos fueron rechazados por "
+                "los filtros de calidad de Radarr.\n"
+                "La pelicula queda monitoreada y se descargara cuando "
+                "aparezca un release que cumpla los criterios."
             )
+            if query.message.photo:
+                await query.edit_message_caption(caption=msg)
+            else:
+                await query.edit_message_text(text=msg)
+            return
+
+        # 6) Construir mensaje con opciones de calidad
+        header = f"{title} ({year})\nOpciones disponibles:\n"
+        option_lines = []
+        buttons = []
+
+        for idx, rel in enumerate(grouped[:6]):  # Máximo 6 opciones
+            cat = rel["quality_category"]
+            size = rel["size_formatted"]
+            seeders = rel.get("seeders", 0)
+            langs = ", ".join(rel.get("languages", [])) or "?"
+            indexer = rel.get("indexer", "?")
+            protocol = rel.get("protocol", "?").upper()
+
+            # Línea descriptiva
+            option_lines.append(
+                f"\n{idx + 1}. {cat} - {size}\n"
+                f"   Seeders: {seeders} | {protocol}\n"
+                f"   Idiomas: {langs}\n"
+                f"   Fuente: {indexer}"
+            )
+
+            # Botón - codificamos guid e indexerId
+            # Truncar guid para caber en callback_data (64 bytes max)
+            guid_short = rel["guid"][:40]
+            btn_label = f"{cat} ({size})"
+            callback = f"{RELEASE_GRAB_PREFIX}{rel['indexerId']}:{guid_short}"
+
+            # Si el callback_data excede 64 bytes, acortar más
+            if len(callback.encode("utf-8")) > 64:
+                guid_short = rel["guid"][:20]
+                callback = f"{RELEASE_GRAB_PREFIX}{rel['indexerId']}:{guid_short}"
+
+            buttons.append(
+                InlineKeyboardButton(btn_label, callback_data=callback)
+            )
+
+        # Almacenar guid completos en contexto (por si se truncaron)
+        # Usamos un dict temporal en la instancia del bot
+        if not hasattr(self, "_pending_releases"):
+            self._pending_releases = {}
+        for idx, rel in enumerate(grouped[:6]):
+            guid_short = rel["guid"][:40]
+            key = f"{rel['indexerId']}:{guid_short}"
+            self._pending_releases[key] = {
+                "guid": rel["guid"],
+                "indexerId": rel["indexerId"],
+                "title": title,
+                "year": year,
+                "quality": rel["quality_category"],
+                "size": rel["size_formatted"],
+            }
+
+        # Organizar botones en filas de 2
+        keyboard_rows = []
+        for i in range(0, len(buttons), 2):
+            keyboard_rows.append(buttons[i:i + 2])
+        # Añadir botón de cancelar
+        keyboard_rows.append([
+            InlineKeyboardButton("Cancelar", callback_data=f"{RELEASE_CANCEL_PREFIX}{tmdb_id}")
+        ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        msg = header + "".join(option_lines)
+
+        if query.message.photo:
+            await query.edit_message_caption(caption=msg, reply_markup=keyboard)
+        else:
+            await query.edit_message_text(text=msg, reply_markup=keyboard)
+
+        logger.info(
+            f"Mostrando {len(grouped)} opciones de calidad para {title} (tmdbId={tmdb_id})"
+        )
+
+    async def _handle_release_grab(self, query, data: str) -> None:
+        """Procesa la selección de un release específico para descargar."""
+        if not self.media or not self.media.enabled:
+            await query.edit_message_text(text="Sistema de peliculas no disponible.")
+            return
+
+        # Parsear callback_data: "rel_grab:{indexerId}:{guid_short}"
+        payload = data[len(RELEASE_GRAB_PREFIX):]
+        key = payload  # indexerId:guid_short
+
+        # Buscar en el cache de pending releases
+        release_info = getattr(self, "_pending_releases", {}).get(key)
+        if not release_info:
+            msg = "La opcion seleccionada ya no esta disponible. Busca la pelicula de nuevo."
+            if query.message.photo:
+                await query.edit_message_caption(caption=msg)
+            else:
+                await query.edit_message_text(text=msg)
+            return
+
+        title = release_info.get("title", "Pelicula")
+        year = release_info.get("year", "")
+        quality = release_info.get("quality", "")
+        size = release_info.get("size", "")
+
+        # Mensaje de progreso
+        progress_msg = f"Descargando {title} en {quality} ({size})..."
+        if query.message.photo:
+            await query.edit_message_caption(caption=progress_msg)
+        else:
+            await query.edit_message_text(text=progress_msg)
+
+        # Grabar el release
+        result = await self.media.grab_release(
+            guid=release_info["guid"],
+            indexer_id=release_info["indexerId"],
+        )
+
+        if result.get("error"):
+            error_msg = f"Error al descargar {title}:\n{result['error']}"
+            if query.message.photo:
+                await query.edit_message_caption(caption=error_msg)
+            else:
+                await query.edit_message_text(text=error_msg)
+            return
+
+        msg = (
+            f"Descarga iniciada!\n\n"
+            f"{title} ({year})\n"
+            f"Calidad: {quality} ({size})\n\n"
+            f"Transmission ya esta descargandola.\n"
+            f"Te avisare cuando este en Jellyfin."
+        )
 
         if query.message.photo:
             await query.edit_message_caption(caption=msg)
         else:
             await query.edit_message_text(text=msg)
 
-        logger.info(f"Pelicula procesada via Telegram: {title} (tmdbId={tmdb_id})")
+        # Limpiar cache
+        self._pending_releases.pop(key, None)
+        logger.info(f"Release grabado via Telegram: {title} {quality} ({size})")
 
     # ==========================================
     # MENSAJES DE TEXTO
