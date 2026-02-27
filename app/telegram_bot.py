@@ -22,6 +22,11 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID, logger
+from app.media_stack import (
+    looks_like_media_stack_start_request,
+    looks_like_media_stack_stop_request,
+    looks_like_media_stack_status_request,
+)
 
 # Prefijos para callback_data de películas (Fase 6/7/6.5)
 MOVIE_DOWNLOAD_PREFIX = "movie_dl:"
@@ -821,6 +826,7 @@ class TelegramBot:
             self._pending_releases[key] = {
                 "guid": rel["guid"],
                 "indexerId": rel["indexerId"],
+                "tmdb_id": tmdb_id,
                 "title": title,
                 "year": year,
                 "quality": rel["quality_category"],
@@ -894,6 +900,11 @@ class TelegramBot:
                 await query.edit_message_text(text=error_msg)
             return
 
+        # Activar monitoreo ahora que ya se eligió el release manualmente
+        tmdb_id = release_info.get("tmdb_id")
+        if tmdb_id:
+            await self.media.set_monitored(tmdb_id, monitored=True)
+
         msg = (
             f"Descarga iniciada!\n\n"
             f"{title} ({year})\n"
@@ -929,8 +940,14 @@ class TelegramBot:
         await update.message.chat.send_action(ChatAction.TYPING)
 
         try:
+            media_stack_command = (
+                looks_like_media_stack_start_request(user_message)
+                or looks_like_media_stack_stop_request(user_message)
+                or looks_like_media_stack_status_request(user_message)
+            )
+
             # Fase 6: Detectar intención de película vía LLM
-            if self.media and self.media.enabled:
+            if self.media and self.media.enabled and not media_stack_command:
                 movie_title = await self._extract_movie_intent(user_message)
                 if movie_title:
                     logger.info(f"Intencion de pelicula detectada: '{movie_title}'")

@@ -1,29 +1,18 @@
 #!/bin/bash
 # Script de inicio para el Agente de IA Local
 # Uso: bash scripts/start.sh
+# Nota: delega en run_service.sh para iniciar tambien servicios multimedia.
+
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+RUN_SERVICE="$SCRIPT_DIR/run_service.sh"
 
-cd "$PROJECT_DIR"
+if [ ! -x "$RUN_SERVICE" ]; then
+  echo "[ERROR] No se encontro run_service.sh en: $RUN_SERVICE"
+  exit 1
+fi
 
 echo "=== Agente de IA Local ==="
-echo "Directorio: $PROJECT_DIR"
-
-# Verificar que Ollama este corriendo
-if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    echo "[WARN] Ollama no esta corriendo. Ejecuta: ollama serve"
-fi
-
-# Activar venv si existe
-if [ -d "venv" ]; then
-    source venv/bin/activate
-    echo "Entorno virtual activado"
-elif [ -d ".venv" ]; then
-    source .venv/bin/activate
-    echo "Entorno virtual activado"
-fi
-
-# Iniciar servidor
-echo "Iniciando servidor en http://localhost:8000 ..."
-python -m app.main
+echo "Iniciando stack completa (Shaggy + servicios multimedia)..."
+exec "$RUN_SERVICE"

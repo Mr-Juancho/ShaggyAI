@@ -58,6 +58,19 @@ Opcion B:
 bash scripts/start.sh
 ```
 
+Por defecto, Shaggy inicia solo (sin stack multimedia).
+Si quieres autoiniciar Radarr/Prowlarr/Transmission/Jellyfin junto con Shaggy:
+
+```bash
+export SHAGGY_START_MEDIA_STACK=true
+```
+
+Modo recomendado (manual):
+- Escribe en el chat de Shaggy: `inicia protocolo peliculas`
+- Se levantan en segundo plano (headless) sin abrir sus webs.
+- Puedes consultar estado con: `estado del protocolo peliculas`
+- Para detenerlo y matar procesos: `apaga protocolo peliculas`
+
 Luego abre:
 - Web desktop: `http://localhost:8000`
 - Salud API: `http://localhost:8000/health`

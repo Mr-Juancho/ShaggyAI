@@ -145,26 +145,29 @@ OLLAMA_LOG={ollama_q}
 mkdir -p "$(dirname "$LAUNCHER_LOG")"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Lanzador iniciado" >> "$LAUNCHER_LOG"
 
-# 1) Ollama
-if ! curl -sf "http://localhost:11434/api/tags" > /dev/null 2>&1; then
-    echo "[INFO] Iniciando ollama serve..." >> "$LAUNCHER_LOG"
-    nohup ollama serve >> "$OLLAMA_LOG" 2>&1 &
-    sleep 2
-fi
-
-# 2) Backend FastAPI
+# 1) Backend FastAPI (+ stack multimedia via run_service.sh)
 if ! curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
     echo "[INFO] Iniciando backend..." >> "$LAUNCHER_LOG"
     cd "$PROJECT_DIR"
-    if [ -d "venv" ]; then
-        source venv/bin/activate
-    elif [ -d ".venv" ]; then
-        source .venv/bin/activate
+    if [ -x "$PROJECT_DIR/scripts/run_service.sh" ]; then
+        nohup "$PROJECT_DIR/scripts/run_service.sh" >> "$SERVER_LOG" 2>&1 &
+    else
+        # Fallback de compatibilidad
+        if ! curl -sf "http://localhost:11434/api/tags" > /dev/null 2>&1; then
+            echo "[INFO] Iniciando ollama serve (fallback)..." >> "$LAUNCHER_LOG"
+            nohup ollama serve >> "$OLLAMA_LOG" 2>&1 &
+            sleep 2
+        fi
+        if [ -d "venv" ]; then
+            source venv/bin/activate
+        elif [ -d ".venv" ]; then
+            source .venv/bin/activate
+        fi
+        nohup python -m app.main >> "$SERVER_LOG" 2>&1 &
     fi
-    nohup python -m app.main >> "$SERVER_LOG" 2>&1 &
 fi
 
-# 3) Esperar a que este listo y abrir navegador
+# 2) Esperar a que este listo y abrir navegador
 for _ in {{1..15}}; do
     if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
         break

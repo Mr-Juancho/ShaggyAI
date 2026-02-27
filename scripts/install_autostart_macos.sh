@@ -11,12 +11,14 @@ SOURCE_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_PROJECT_DIR="$(dirname "$SOURCE_SCRIPT_DIR")"
 RUNTIME_BASE="$HOME/Library/Application Support/Shaggy"
 RUNTIME_DIR="$RUNTIME_BASE/runtime"
+LAUNCH_HELPER="$RUNTIME_BASE/launch_shaggy.sh"
 
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_AGENT_DIR/com.shaggy.agent.plist"
 RUN_SCRIPT="$RUNTIME_DIR/scripts/run_service.sh"
 LOG_DIR="$RUNTIME_DIR/data/logs"
 NEW_LABEL="com.shaggy.agent"
+LEGACY_LABEL="com.juancho.shaggy"
 
 mkdir -p "$LAUNCH_AGENT_DIR" "$LOG_DIR" "$RUNTIME_BASE"
 
@@ -32,6 +34,39 @@ rsync -a --delete \
   "$SOURCE_PROJECT_DIR/" "$RUNTIME_DIR/"
 
 chmod +x "$RUN_SCRIPT"
+
+cat > "$LAUNCH_HELPER" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+APP_URL='http://localhost:8000'
+HEALTH_URL='http://localhost:8000/health'
+PRIMARY_LABEL='$NEW_LABEL'
+LEGACY_LABEL='$LEGACY_LABEL'
+PLIST_PATH='$PLIST_PATH'
+
+if ! curl -sf "\$HEALTH_URL" >/dev/null 2>&1; then
+  # Asegurar que el agente actual este cargado (si no lo esta, bootstrap).
+  launchctl print "gui/\$(id -u)/\$PRIMARY_LABEL" >/dev/null 2>&1 || {
+    launchctl bootstrap "gui/\$(id -u)" "\$PLIST_PATH" 2>/dev/null || true
+    launchctl enable "gui/\$(id -u)/\$PRIMARY_LABEL" 2>/dev/null || true
+  }
+
+  launchctl kickstart -k "gui/\$(id -u)/\$PRIMARY_LABEL" 2>/dev/null || \
+  launchctl kickstart -k "gui/\$(id -u)/\$LEGACY_LABEL" 2>/dev/null || true
+
+  for _ in {1..25}; do
+    if curl -sf "\$HEALTH_URL" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
+
+open "\$APP_URL"
+EOF
+
+chmod +x "$LAUNCH_HELPER"
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -99,5 +134,6 @@ launchctl kickstart -k "gui/$(id -u)/$NEW_LABEL"
 echo "Autoinicio instalado."
 echo "PLIST: $PLIST_PATH"
 echo "Runtime: $RUNTIME_DIR"
+echo "Launcher App: $LAUNCH_HELPER"
 echo "Estado:"
 launchctl print "gui/$(id -u)/$NEW_LABEL" | sed -n '1,80p'

@@ -757,7 +757,7 @@ async function fetchReleases(card, tmdbId, title, year) {
             return;
         }
 
-        renderReleaseOptions(card, releases, title, year);
+        renderReleaseOptions(card, releases, title, year, tmdbId);
 
     } catch (err) {
         console.error('Error buscando releases:', err);
@@ -769,7 +769,7 @@ async function fetchReleases(card, tmdbId, title, year) {
 /**
  * Renderiza las opciones de calidad como botones minimalistas
  */
-function renderReleaseOptions(card, releases, title, year) {
+function renderReleaseOptions(card, releases, title, year, tmdbId) {
     const actionsDiv = card.querySelector('.movie-actions') || card.querySelector('.movie-info');
 
     let html = '<div class="release-options">';
@@ -787,6 +787,7 @@ function renderReleaseOptions(card, releases, title, year) {
         pendingReleases[key] = {
             guid: rel.guid,
             indexerId: rel.indexerId,
+            tmdbId: tmdbId,
             title, year, quality: cat, size,
         };
 
@@ -837,7 +838,7 @@ async function grabRelease(card, info) {
         const resp = await fetch('/movie/grab', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ guid: info.guid, indexer_id: info.indexerId }),
+            body: JSON.stringify({ guid: info.guid, indexer_id: info.indexerId, tmdb_id: info.tmdbId || null }),
         });
 
         if (!resp.ok) {

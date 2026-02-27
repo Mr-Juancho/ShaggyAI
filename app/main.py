@@ -19,6 +19,15 @@ from pydantic import BaseModel, Field
 
 from app.config import FRONTEND_DIR, HOST, MAX_CONTEXT_MESSAGES, PORT, RELOAD, logger
 from app.llm_engine import OllamaEngine
+from app.media_stack import (
+    build_media_stack_status_response,
+    get_media_stack_status,
+    looks_like_media_stack_start_request,
+    looks_like_media_stack_stop_request,
+    looks_like_media_stack_status_request,
+    start_media_stack_headless,
+    stop_media_stack_headless,
+)
 from app.system_prompt import build_system_prompt
 from app.utils import contains_datetime_reference, extract_search_intent, truncate_text
 
@@ -149,6 +158,7 @@ if RadarrClient is not None:
 
 telegram_bot = None
 telegram_task: Optional[asyncio.Task] = None
+media_stack_start_task: Optional[asyncio.Task] = None
 
 REMINDER_REQUEST_RE = re.compile(
     r"\b(recu[eé]rdame|recordarme|no\s+olvidar|av[ií]same|avisame)\b|"
@@ -1048,6 +1058,85 @@ async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
     return None
 
 
+async def _handle_media_stack_action(message: str) -> Optional[str]:
+    """
+    Maneja acciones del protocolo de peliculas:
+    - iniciar stack multimedia bajo demanda (headless)
+    - consultar estado actual
+    """
+    if looks_like_media_stack_status_request(message):
+        return build_media_stack_status_response()
+
+    if looks_like_media_stack_stop_request(message):
+        before = build_media_stack_status_response()
+        success, status, detail = await stop_media_stack_headless(timeout_seconds=120)
+        after = build_media_stack_status_response(status)
+
+        if success:
+            return (
+                "Listo. Apague el protocolo peliculas y detuve los procesos asociados.\n"
+                f"{after}"
+            )
+        if detail:
+            return (
+                "Intente apagar el protocolo peliculas, pero quedo parcial.\n"
+                f"{after}\n"
+                f"Detalle tecnico: {truncate_text(detail, max_length=240)}"
+            )
+        return (
+            "Intente apagar el protocolo peliculas, pero quedo parcial.\n"
+            f"Estado previo: {before}\n"
+            f"Estado actual: {after}"
+        )
+
+    if not looks_like_media_stack_start_request(message):
+        return None
+
+    global media_stack_start_task
+
+    status_now = get_media_stack_status()
+    if all(status_now.values()):
+        return (
+            "El protocolo peliculas ya esta activo.\n"
+            f"{build_media_stack_status_response(status_now)}"
+        )
+
+    if media_stack_start_task and not media_stack_start_task.done():
+        return (
+            "Ya estoy activando el protocolo peliculas en segundo plano.\n"
+            f"{build_media_stack_status_response(status_now)}\n"
+            "Consulta en unos segundos con: estado del protocolo peliculas."
+        )
+
+    media_stack_start_task = asyncio.create_task(
+        start_media_stack_headless(timeout_seconds=180),
+        name="media-stack-start",
+    )
+
+    def _on_media_stack_start_done(task: asyncio.Task) -> None:
+        try:
+            success, status, detail = task.result()
+            if success:
+                logger.info(f"Arranque de protocolo peliculas completado: {status}")
+            else:
+                logger.warning(
+                    "Arranque de protocolo peliculas incompleto: "
+                    f"status={status}, detail={truncate_text(detail, max_length=200)}"
+                )
+        except asyncio.CancelledError:
+            logger.info("Tarea de arranque de protocolo peliculas cancelada.")
+        except Exception as exc:
+            logger.error(f"Fallo en tarea de arranque de protocolo peliculas: {exc}")
+
+    media_stack_start_task.add_done_callback(_on_media_stack_start_done)
+
+    return (
+        "Listo, active el protocolo peliculas en segundo plano.\n"
+        "Puede tardar unos segundos mientras suben los servicios.\n"
+        "Verifica avance con: estado del protocolo peliculas."
+    )
+
+
 async def process_chat_message(message: str, user_id: str, source: str = "api") -> str:
     """
     Flujo principal de chat compartido por API y Telegram.
@@ -1060,100 +1149,104 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
         del history[:-MAX_CONTEXT_MESSAGES]
 
     response_text: str
-    deterministic_reminder_response = await _handle_reminder_action(message, user_id)
-    if deterministic_reminder_response is not None:
-        response_text = deterministic_reminder_response
+    deterministic_media_response = await _handle_media_stack_action(message)
+    if deterministic_media_response is not None:
+        response_text = deterministic_media_response
     else:
-        explicit_web_request = _is_explicit_web_request(message)
-        memory_context = ""
-        if memory_manager:
-            memory_context = await memory_manager.search_relevant_context(query=message, n=5)
-            memory_context = _sanitize_memory_context(memory_context)
+        deterministic_reminder_response = await _handle_reminder_action(message, user_id)
+        if deterministic_reminder_response is not None:
+            response_text = deterministic_reminder_response
+        else:
+            explicit_web_request = _is_explicit_web_request(message)
+            memory_context = ""
+            if memory_manager:
+                memory_context = await memory_manager.search_relevant_context(query=message, n=5)
+                memory_context = _sanitize_memory_context(memory_context)
 
-        web_query, web_results, web_context = await _build_web_context(
-            message,
-            history=history,
-            allow_web_search=explicit_web_request,
-        )
-        combined_context = "\n\n".join(
-            part for part in (memory_context.strip(), web_context.strip()) if part
-        )
+            web_query, web_results, web_context = await _build_web_context(
+                message,
+                history=history,
+                allow_web_search=explicit_web_request,
+            )
+            combined_context = "\n\n".join(
+                part for part in (memory_context.strip(), web_context.strip()) if part
+            )
 
-        active_reminders = ""
-        if reminder_manager:
-            active_reminders = reminder_manager.get_active_reminders_text()
+            active_reminders = ""
+            if reminder_manager:
+                active_reminders = reminder_manager.get_active_reminders_text()
 
-        system_prompt = build_system_prompt(
-            memory_context=combined_context or None,
-            active_reminders=active_reminders or None,
-        )
-        channel_addendum = _channel_prompt_addendum(source)
-        if channel_addendum:
-            system_prompt = f"{system_prompt}\n\n{channel_addendum}"
+            system_prompt = build_system_prompt(
+                memory_context=combined_context or None,
+                active_reminders=active_reminders or None,
+            )
+            channel_addendum = _channel_prompt_addendum(source)
+            if channel_addendum:
+                system_prompt = f"{system_prompt}\n\n{channel_addendum}"
 
-        model_history = _sanitize_history_for_generation(history)
-        response_text = await llm_engine.generate_response(
-            messages=model_history,
-            system_prompt=system_prompt,
-        )
+            model_history = _sanitize_history_for_generation(history)
+            response_text = await llm_engine.generate_response(
+                messages=model_history,
+                system_prompt=system_prompt,
+            )
 
-        # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
-        if web_results and (
-            not response_text.strip()
-            or response_text.startswith("Error:")
-            or response_text.strip().upper() == "NADA"
-            or len(response_text.strip()) <= 8
-            or "no pude generar una respuesta" in response_text.lower()
-        ):
-            response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
-
-        # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
-        # intentamos una busqueda directa con el mensaje completo.
-        if (
-            web_search_engine
-            and explicit_web_request
-            and not web_results
-            and (
+            # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
+            if web_results and (
                 not response_text.strip()
                 or response_text.startswith("Error:")
-                or "no pude generar una respuesta" in response_text.lower()
                 or response_text.strip().upper() == "NADA"
                 or len(response_text.strip()) <= 8
-            )
-        ):
-            rescue_query = _normalize_web_query(message)
-            if rescue_query:
-                rescue_results = await web_search_engine.search(rescue_query, max_results=5)
-                if rescue_results:
-                    response_text = _format_web_results_for_user(
-                        rescue_query,
-                        rescue_results,
-                        max_results=5,
-                    )
+                or "no pude generar una respuesta" in response_text.lower()
+            ):
+                response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
 
-        if source == "telegram" and web_results:
-            response_text = _append_telegram_sources_block(response_text, web_results)
+            # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
+            # intentamos una busqueda directa con el mensaje completo.
+            if (
+                web_search_engine
+                and explicit_web_request
+                and not web_results
+                and (
+                    not response_text.strip()
+                    or response_text.startswith("Error:")
+                    or "no pude generar una respuesta" in response_text.lower()
+                    or response_text.strip().upper() == "NADA"
+                    or len(response_text.strip()) <= 8
+                )
+            ):
+                rescue_query = _normalize_web_query(message)
+                if rescue_query:
+                    rescue_results = await web_search_engine.search(rescue_query, max_results=5)
+                    if rescue_results:
+                        response_text = _format_web_results_for_user(
+                            rescue_query,
+                            rescue_results,
+                            max_results=5,
+                        )
 
-        # Reintento defensivo: cuando el modelo responde rechazo generico
-        # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
-        if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
-            logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
-            retry_prompt = (
-                f"{system_prompt}\n\n"
-                "La solicitud actual es benigna y permitida. "
-                "Responde de forma util y breve; no devuelvas rechazos genericos."
-            )
-            retry_response = await llm_engine.generate_response(
-                messages=_sanitize_history_for_generation(history),
-                system_prompt=retry_prompt,
-            )
-            if retry_response.strip() and not _is_generic_refusal(retry_response):
-                response_text = retry_response
+            if source == "telegram" and web_results:
+                response_text = _append_telegram_sources_block(response_text, web_results)
 
-        auto_reminder_note = await _try_auto_reminder(message)
-        if auto_reminder_note:
-            response_text = _remove_reminder_denials(response_text)
-            response_text = f"{response_text}\n\n{auto_reminder_note}"
+            # Reintento defensivo: cuando el modelo responde rechazo generico
+            # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
+            if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
+                logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
+                retry_prompt = (
+                    f"{system_prompt}\n\n"
+                    "La solicitud actual es benigna y permitida. "
+                    "Responde de forma util y breve; no devuelvas rechazos genericos."
+                )
+                retry_response = await llm_engine.generate_response(
+                    messages=_sanitize_history_for_generation(history),
+                    system_prompt=retry_prompt,
+                )
+                if retry_response.strip() and not _is_generic_refusal(retry_response):
+                    response_text = retry_response
+
+            auto_reminder_note = await _try_auto_reminder(message)
+            if auto_reminder_note:
+                response_text = _remove_reminder_denials(response_text)
+                response_text = f"{response_text}\n\n{auto_reminder_note}"
 
     response_text = _normalize_response_format(response_text)
 
@@ -1353,7 +1446,17 @@ async def chat(request: ChatRequest) -> ChatResponse:
     """Endpoint principal de chat."""
 
     # Detectar intención de película para fuentes web/desktop
-    if radarr_client and radarr_client.enabled and request.source in ("desktop", "api"):
+    media_stack_command = (
+        looks_like_media_stack_start_request(request.message)
+        or looks_like_media_stack_stop_request(request.message)
+        or looks_like_media_stack_status_request(request.message)
+    )
+    if (
+        radarr_client
+        and radarr_client.enabled
+        and request.source in ("desktop", "api")
+        and not media_stack_command
+    ):
         movie_title = await _extract_movie_title(request.message)
         if movie_title:
             logger.info(f"[{request.source}] Intención de película detectada: '{movie_title}'")
@@ -1384,6 +1487,7 @@ class MovieReleasesRequest(BaseModel):
 class MovieGrabRequest(BaseModel):
     guid: str
     indexer_id: int
+    tmdb_id: Optional[int] = None
 
 
 @app.post("/movie/add-and-releases")
@@ -1427,7 +1531,7 @@ async def movie_add_and_releases(request: MovieReleasesRequest) -> dict[str, Any
 
 @app.post("/movie/grab")
 async def movie_grab(request: MovieGrabRequest) -> dict[str, Any]:
-    """Descarga un release específico."""
+    """Descarga un release específico y activa monitoreo."""
     if not radarr_client or not radarr_client.enabled:
         raise HTTPException(status_code=503, detail="Radarr no configurado.")
 
@@ -1439,6 +1543,20 @@ async def movie_grab(request: MovieGrabRequest) -> dict[str, Any]:
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
 
+    # Activar monitoreo ahora que el usuario eligió el release manualmente
+    if request.tmdb_id:
+        await radarr_client.set_monitored(request.tmdb_id, monitored=True)
+
+    return result
+
+
+@app.post("/movie/remove-duplicates")
+async def movie_remove_duplicates() -> dict[str, Any]:
+    """Busca y elimina películas duplicadas en Radarr."""
+    if not radarr_client or not radarr_client.enabled:
+        raise HTTPException(status_code=503, detail="Radarr no configurado.")
+
+    result = await radarr_client.remove_duplicates()
     return result
 
 
