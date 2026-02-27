@@ -17,18 +17,27 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from app.capability_registry import CapabilityRegistry
 from app.config import FRONTEND_DIR, HOST, MAX_CONTEXT_MESSAGES, PORT, RELOAD, logger
 from app.llm_engine import OllamaEngine
 from app.media_stack import (
     build_media_stack_status_response,
     get_media_stack_status,
+    infer_media_stack_action_semantic,
+    looks_like_media_stack_followup_start_request,
+    looks_like_media_stack_followup_stop_request,
     looks_like_media_stack_start_request,
     looks_like_media_stack_stop_request,
     looks_like_media_stack_status_request,
     start_media_stack_headless,
     stop_media_stack_headless,
 )
+from app.memory_semantic import extract_memory_write_plan
+from app.product_scope import ProductScope
+from app.response_verifier import verify_response
+from app.semantic_router import RouteDecision, SemanticRouter
 from app.system_prompt import build_system_prompt
+from app.time_policy import as_capability_output, build_datetime_context, has_temporal_reference
 from app.utils import contains_datetime_reference, extract_search_intent, truncate_text
 
 try:
@@ -127,6 +136,18 @@ class HealthResponse(BaseModel):
 conversation_history: dict[str, list[dict[str, str]]] = {}
 pending_reminder_by_user: dict[str, dict[str, str]] = {}
 llm_engine = OllamaEngine()
+product_scope = ProductScope()
+capability_registry = CapabilityRegistry(product_scope=product_scope)
+missing_in_registry, extra_in_registry = capability_registry.ensure_scope_consistency()
+if missing_in_registry:
+    logger.warning(f"Scope sin capability en registro: {sorted(missing_in_registry)}")
+if extra_in_registry:
+    logger.warning(f"Registro fuera de scope: {sorted(extra_in_registry)}")
+semantic_router = SemanticRouter(
+    llm_engine=llm_engine,
+    capability_registry=capability_registry,
+    product_scope=product_scope,
+)
 
 memory_manager = None
 if MemoryManager is not None:
@@ -802,6 +823,8 @@ async def _build_web_context(
     message: str,
     history: Optional[list[dict[str, str]]] = None,
     allow_web_search: bool = True,
+    query_override: str = "",
+    prefer_news: bool = False,
 ) -> tuple[str, list[dict[str, str]], str]:
     """Detecta intencion de busqueda y construye contexto web."""
     if not web_search_engine:
@@ -809,7 +832,9 @@ async def _build_web_context(
     if not allow_web_search:
         return "", [], ""
 
-    query = extract_search_intent(message)
+    query = (query_override or "").strip()
+    if not query:
+        query = extract_search_intent(message) or ""
     if query:
         query = _normalize_web_query(query)
     message_lower = message.lower()
@@ -838,19 +863,46 @@ async def _build_web_context(
         if len(query.split()) <= 3 and "precio" not in query and "cotizacion" not in query:
             query = f"precio actual de {query}"
 
-    use_news = any(word in message_lower for word in ("noticias", "news", "actualidad", "hoy"))
-    logger.info(f"Intencion web detectada. Query='{query}', news={use_news}")
+    use_news = prefer_news or any(
+        word in message_lower for word in ("noticias", "news", "actualidad", "hoy")
+    )
+    logger.info(
+        f"Intencion web detectada. Query='{query}', news={use_news}, prefer_news={prefer_news}"
+    )
 
-    if use_news:
-        results = await web_search_engine.search_news(query, max_results=5)
-    else:
-        results = await web_search_engine.search(query, max_results=5)
+    # Fase 3: escalera anti-fracaso para busqueda web.
+    # primario -> alternativo -> web general.
+    ladder: list[str] = (
+        ["web_search_news", "web_search_general", "web_search_news"]
+        if use_news
+        else ["web_search_general", "web_search_news", "web_search_general"]
+    )
+
+    results: list[dict[str, str]] = []
+    used_capability = ""
+    for capability_id in ladder:
+        if not capability_registry.get(capability_id):
+            continue
+        used_capability = capability_id
+        try:
+            if capability_id == "web_search_news":
+                results = await web_search_engine.search_news(query, max_results=5)
+            else:
+                results = await web_search_engine.search(query, max_results=5)
+        except Exception as exc:
+            logger.warning(f"Fallo en herramienta {capability_id}: {exc}")
+            results = []
+        if results:
+            break
 
     if not results:
         logger.warning(f"Busqueda web sin resultados para query='{query}'")
         return query, [], ""
 
-    lines = ["Resultados recientes de busqueda web para apoyar la respuesta:"]
+    lines = [
+        "Resultados recientes de busqueda web para apoyar la respuesta:",
+        f"Herramienta usada: {used_capability or 'web_search_general'}",
+    ]
     for idx, result in enumerate(results, 1):
         title = _sanitize_web_text(result.get("title", ""), max_length=140)
         snippet = _sanitize_web_text(result.get("snippet", ""), max_length=220)
@@ -1058,16 +1110,153 @@ async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
     return None
 
 
-async def _handle_media_stack_action(message: str) -> Optional[str]:
+async def _handle_semantic_memory_store(
+    message: str,
+    history: list[dict[str, str]],
+    user_id: str,
+) -> str:
+    """
+    Guarda memoria de largo plazo cuando el usuario lo pide de forma explícita,
+    usando extracción semántica estructurada (sin reglas rígidas por frase).
+    """
+    if not memory_manager:
+        return (
+            "Ahora mismo no tengo disponible el modulo de memoria de largo plazo. "
+            "Revisa dependencias (chromadb) y reinicia el servicio."
+        )
+
+    plan = await extract_memory_write_plan(
+        llm_engine=llm_engine,
+        message=message,
+        history=history,
+    )
+    if not plan or not plan.should_store:
+        if plan and plan.clarification_question:
+            return plan.clarification_question
+        return "Puedo guardarlo, pero necesito que me lo indiques en una frase mas concreta."
+
+    stored_count = 0
+    skipped_duplicates = 0
+    stored_facts: list[str] = []
+    for fact in plan.facts:
+        stored = await memory_manager.store_user_info(
+            info=fact,
+            metadata={"source": "semantic_memory_store", "user_id": user_id},
+        )
+        if stored:
+            stored_count += 1
+            stored_facts.append(fact)
+        else:
+            skipped_duplicates += 1
+
+    if stored_count == 0:
+        return "Eso ya lo tenia guardado en memoria de largo plazo."
+
+    lines = ["Listo, ya lo guarde en memoria de largo plazo:"]
+    lines.extend(f"- {fact}" for fact in stored_facts[:4])
+    if skipped_duplicates:
+        lines.append(f"- (Omiti {skipped_duplicates} dato(s) duplicado(s)).")
+    return "\n".join(lines)
+
+
+async def _handle_semantic_memory_recall(message: str) -> str:
+    """Responde consultas explícitas sobre memoria guardada del usuario."""
+    if not memory_manager:
+        return (
+            "Ahora mismo no tengo disponible el modulo de memoria de largo plazo. "
+            "Revisa dependencias (chromadb) y reinicia el servicio."
+        )
+
+    context = await memory_manager.search_relevant_context(query=message, n=8)
+    context = _sanitize_memory_context(context)
+    if not context:
+        return "Todavia no tengo recuerdos guardados sobre eso."
+    return "Esto es lo que recuerdo ahora:\n" + context
+
+
+def _recent_history_texts(history: Optional[list[dict[str, str]]], max_items: int = 8) -> list[str]:
+    """Extrae texto reciente del historial para desambiguar comandos cortos."""
+    if not history:
+        return []
+    texts: list[str] = []
+    for item in history[-max_items:]:
+        content = str(item.get("content", "")).strip()
+        if content:
+            texts.append(content)
+    return texts
+
+
+def _media_action_from_route(route_decision: RouteDecision, confidence_floor: float = 0.72) -> Optional[str]:
+    """
+    Traduce candidate_tools del router a una accion ejecutable de media stack.
+    Requiere confianza minima para evitar ejecuciones accidentales.
+    """
+    if route_decision.confidence < confidence_floor:
+        return None
+
+    tools = set(route_decision.candidate_tools or [])
+    if "media_stack_stop" in tools:
+        return "stop"
+    if "media_stack_start" in tools:
+        return "start"
+    if "media_stack_status" in tools:
+        return "status"
+    return None
+
+
+async def _handle_media_stack_action(
+    message: str,
+    history: Optional[list[dict[str, str]]] = None,
+    llm: Any = None,
+    forced_action: Optional[str] = None,
+) -> Optional[str]:
     """
     Maneja acciones del protocolo de peliculas:
     - iniciar stack multimedia bajo demanda (headless)
     - consultar estado actual
     """
-    if looks_like_media_stack_status_request(message):
+    recent_texts = _recent_history_texts(history)
+
+    status_requested = looks_like_media_stack_status_request(message)
+    stop_requested = looks_like_media_stack_stop_request(message) or (
+        looks_like_media_stack_followup_stop_request(message, recent_texts)
+    )
+    start_requested = looks_like_media_stack_start_request(message) or (
+        looks_like_media_stack_followup_start_request(message, recent_texts)
+    )
+
+    action = (forced_action or "").strip().lower()
+    if action == "status":
+        status_requested = True
+    elif action == "stop":
+        stop_requested = True
+    elif action == "start":
+        start_requested = True
+
+    if not (status_requested or stop_requested or start_requested):
+        semantic = await infer_media_stack_action_semantic(
+            message=message,
+            recent_messages=recent_texts,
+            llm_engine=llm,
+            min_confidence=0.62,
+        )
+        if semantic.action != "none":
+            logger.info(
+                "Media intent semantica detectada: action=%s confidence=%.2f",
+                semantic.action,
+                semantic.confidence,
+            )
+            if semantic.action == "status":
+                status_requested = True
+            elif semantic.action == "stop":
+                stop_requested = True
+            elif semantic.action == "start":
+                start_requested = True
+
+    if status_requested:
         return build_media_stack_status_response()
 
-    if looks_like_media_stack_stop_request(message):
+    if stop_requested:
         before = build_media_stack_status_response()
         success, status, detail = await stop_media_stack_headless(timeout_seconds=120)
         after = build_media_stack_status_response(status)
@@ -1089,7 +1278,7 @@ async def _handle_media_stack_action(message: str) -> Optional[str]:
             f"Estado actual: {after}"
         )
 
-    if not looks_like_media_stack_start_request(message):
+    if not start_requested:
         return None
 
     global media_stack_start_task
@@ -1149,7 +1338,20 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
         del history[:-MAX_CONTEXT_MESSAGES]
 
     response_text: str
-    deterministic_media_response = await _handle_media_stack_action(message)
+    route_decision = RouteDecision(
+        intent="general_chat",
+        entities={"temporal_reference": False},
+        candidate_tools=["chat_general"],
+        confidence=1.0,
+    )
+    web_results: list[dict[str, str]] = []
+    datetime_payload: dict[str, str] = {}
+
+    deterministic_media_response = await _handle_media_stack_action(
+        message,
+        history=history,
+        llm=llm_engine,
+    )
     if deterministic_media_response is not None:
         response_text = deterministic_media_response
     else:
@@ -1157,98 +1359,175 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
         if deterministic_reminder_response is not None:
             response_text = deterministic_reminder_response
         else:
-            explicit_web_request = _is_explicit_web_request(message)
-            memory_context = ""
-            if memory_manager:
-                memory_context = await memory_manager.search_relevant_context(query=message, n=5)
-                memory_context = _sanitize_memory_context(memory_context)
+            route_decision = await semantic_router.route(message=message, history=history)
 
-            web_query, web_results, web_context = await _build_web_context(
-                message,
-                history=history,
-                allow_web_search=explicit_web_request,
-            )
-            combined_context = "\n\n".join(
-                part for part in (memory_context.strip(), web_context.strip()) if part
-            )
+            route_media_action = _media_action_from_route(route_decision)
+            route_media_response = None
+            if route_media_action:
+                route_media_response = await _handle_media_stack_action(
+                    message=message,
+                    history=history,
+                    llm=llm_engine,
+                    forced_action=route_media_action,
+                )
 
-            active_reminders = ""
-            if reminder_manager:
-                active_reminders = reminder_manager.get_active_reminders_text()
-
-            system_prompt = build_system_prompt(
-                memory_context=combined_context or None,
-                active_reminders=active_reminders or None,
-            )
-            channel_addendum = _channel_prompt_addendum(source)
-            if channel_addendum:
-                system_prompt = f"{system_prompt}\n\n{channel_addendum}"
-
-            model_history = _sanitize_history_for_generation(history)
-            response_text = await llm_engine.generate_response(
-                messages=model_history,
-                system_prompt=system_prompt,
-            )
-
-            # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
-            if web_results and (
-                not response_text.strip()
-                or response_text.startswith("Error:")
-                or response_text.strip().upper() == "NADA"
-                or len(response_text.strip()) <= 8
-                or "no pude generar una respuesta" in response_text.lower()
+            if route_media_response is not None:
+                response_text = route_media_response
+            elif (
+                route_decision.intent == "memory_store"
+                and capability_registry.get("memory_store_user_fact")
             ):
-                response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
+                response_text = await _handle_semantic_memory_store(
+                    message=message,
+                    history=history,
+                    user_id=user_id,
+                )
+            elif (
+                route_decision.intent == "memory_recall"
+                and capability_registry.get("memory_recall_profile")
+            ):
+                response_text = await _handle_semantic_memory_recall(message=message)
+            else:
+                explicit_web_request = _is_explicit_web_request(message)
+                route_requires_web = route_decision.intent == "web_search" or any(
+                    tool in {"web_search_general", "web_search_news"}
+                    for tool in route_decision.candidate_tools
+                )
+                allow_web_search = explicit_web_request or route_requires_web
 
-            # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
-            # intentamos una busqueda directa con el mensaje completo.
-            if (
-                web_search_engine
-                and explicit_web_request
-                and not web_results
-                and (
+                memory_context = ""
+                if memory_manager:
+                    memory_context = await memory_manager.search_relevant_context(query=message, n=5)
+                    memory_context = _sanitize_memory_context(memory_context)
+
+                temporal_context = ""
+                should_inject_datetime = (
+                    has_temporal_reference(message)
+                    or bool(route_decision.entities.get("temporal_reference"))
+                    or "get_current_datetime" in route_decision.candidate_tools
+                )
+                if should_inject_datetime and capability_registry.get("get_current_datetime"):
+                    datetime_payload = as_capability_output()
+                    temporal_context = build_datetime_context()
+
+                route_query = str(route_decision.entities.get("query", "")).strip()
+                prefer_news = bool(route_decision.entities.get("prefer_news"))
+                web_query, web_results, web_context = await _build_web_context(
+                    message,
+                    history=history,
+                    allow_web_search=allow_web_search,
+                    query_override=route_query,
+                    prefer_news=prefer_news,
+                )
+                combined_context = "\n\n".join(
+                    part
+                    for part in (
+                        memory_context.strip(),
+                        temporal_context.strip(),
+                        web_context.strip(),
+                    )
+                    if part
+                )
+
+                active_reminders = ""
+                if reminder_manager:
+                    active_reminders = reminder_manager.get_active_reminders_text()
+
+                system_prompt = build_system_prompt(
+                    memory_context=combined_context or None,
+                    active_reminders=active_reminders or None,
+                )
+                channel_addendum = _channel_prompt_addendum(source)
+                if channel_addendum:
+                    system_prompt = f"{system_prompt}\n\n{channel_addendum}"
+
+                model_history = _sanitize_history_for_generation(history)
+                response_text = await llm_engine.generate_response(
+                    messages=model_history,
+                    system_prompt=system_prompt,
+                )
+
+                # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
+                if web_results and (
                     not response_text.strip()
                     or response_text.startswith("Error:")
-                    or "no pude generar una respuesta" in response_text.lower()
                     or response_text.strip().upper() == "NADA"
                     or len(response_text.strip()) <= 8
-                )
-            ):
-                rescue_query = _normalize_web_query(message)
-                if rescue_query:
-                    rescue_results = await web_search_engine.search(rescue_query, max_results=5)
-                    if rescue_results:
-                        response_text = _format_web_results_for_user(
-                            rescue_query,
-                            rescue_results,
-                            max_results=5,
+                    or "no pude generar una respuesta" in response_text.lower()
+                ):
+                    response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
+
+                # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
+                # intentamos una busqueda directa con el mensaje completo.
+                if (
+                    web_search_engine
+                    and route_requires_web
+                    and not web_results
+                    and (
+                        not response_text.strip()
+                        or response_text.startswith("Error:")
+                        or "no pude generar una respuesta" in response_text.lower()
+                        or response_text.strip().upper() == "NADA"
+                        or len(response_text.strip()) <= 8
+                    )
+                ):
+                    rescue_query = _normalize_web_query(message)
+                    if rescue_query:
+                        rescue_results = await web_search_engine.search(rescue_query, max_results=5)
+                        if rescue_results:
+                            response_text = _format_web_results_for_user(
+                                rescue_query,
+                                rescue_results,
+                                max_results=5,
+                            )
+
+                if route_requires_web and not web_results:
+                    if web_query and not _is_low_signal_web_query(web_query):
+                        response_text = (
+                            f"No encontre resultados verificables para '{web_query}'. "
+                            "Puedo reintentar si me das pais, fuente preferida o rango de fechas."
+                        )
+                    else:
+                        response_text = (
+                            route_decision.clarification_question
+                            or "No encontre resultados verificables. "
+                            "Podrias especificar mejor el tema que quieres buscar?"
                         )
 
-            if source == "telegram" and web_results:
-                response_text = _append_telegram_sources_block(response_text, web_results)
+                if source == "telegram" and web_results:
+                    response_text = _append_telegram_sources_block(response_text, web_results)
 
-            # Reintento defensivo: cuando el modelo responde rechazo generico
-            # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
-            if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
-                logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
-                retry_prompt = (
-                    f"{system_prompt}\n\n"
-                    "La solicitud actual es benigna y permitida. "
-                    "Responde de forma util y breve; no devuelvas rechazos genericos."
-                )
-                retry_response = await llm_engine.generate_response(
-                    messages=_sanitize_history_for_generation(history),
-                    system_prompt=retry_prompt,
-                )
-                if retry_response.strip() and not _is_generic_refusal(retry_response):
-                    response_text = retry_response
+                # Reintento defensivo: cuando el modelo responde rechazo generico
+                # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
+                if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
+                    logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
+                    retry_prompt = (
+                        f"{system_prompt}\n\n"
+                        "La solicitud actual es benigna y permitida. "
+                        "Responde de forma util y breve; no devuelvas rechazos genericos."
+                    )
+                    retry_response = await llm_engine.generate_response(
+                        messages=_sanitize_history_for_generation(history),
+                        system_prompt=retry_prompt,
+                    )
+                    if retry_response.strip() and not _is_generic_refusal(retry_response):
+                        response_text = retry_response
 
-            auto_reminder_note = await _try_auto_reminder(message)
-            if auto_reminder_note:
-                response_text = _remove_reminder_denials(response_text)
-                response_text = f"{response_text}\n\n{auto_reminder_note}"
+                auto_reminder_note = await _try_auto_reminder(message)
+                if auto_reminder_note:
+                    response_text = _remove_reminder_denials(response_text)
+                    response_text = f"{response_text}\n\n{auto_reminder_note}"
 
     response_text = _normalize_response_format(response_text)
+    verification = verify_response(
+        response_text=response_text,
+        route=route_decision,
+        web_results=web_results,
+        datetime_payload=datetime_payload,
+    )
+    response_text = verification.response
+    if verification.issues:
+        logger.info(f"Respuesta ajustada por verificador: {verification.issues}")
 
     history.append({"role": "assistant", "content": response_text})
     if len(history) > MAX_CONTEXT_MESSAGES:
@@ -1445,10 +1724,15 @@ async def _extract_movie_title(message: str) -> Optional[str]:
 async def chat(request: ChatRequest) -> ChatResponse:
     """Endpoint principal de chat."""
 
+    history_preview = conversation_history.get(request.user_id, [])
+    recent_texts = _recent_history_texts(history_preview)
+
     # Detectar intención de película para fuentes web/desktop
     media_stack_command = (
         looks_like_media_stack_start_request(request.message)
+        or looks_like_media_stack_followup_start_request(request.message, recent_texts)
         or looks_like_media_stack_stop_request(request.message)
+        or looks_like_media_stack_followup_stop_request(request.message, recent_texts)
         or looks_like_media_stack_status_request(request.message)
     )
     if (

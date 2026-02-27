@@ -1,6 +1,6 @@
 #!/bin/bash
-# Instala autoinicio de Shaggy en macOS usando LaunchAgent de usuario.
-# Copia el runtime a ~/Library/Application Support/Shaggy/runtime para evitar
+# Instala autoinicio de RUFÜS en macOS usando LaunchAgent de usuario.
+# Copia el runtime a ~/Library/Application Support/RUFUS/runtime para evitar
 # bloqueos de permisos de launchd cuando el proyecto vive en Desktop/Documents.
 # Uso:
 #   bash scripts/install_autostart_macos.sh
@@ -9,16 +9,15 @@ set -euo pipefail
 
 SOURCE_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_PROJECT_DIR="$(dirname "$SOURCE_SCRIPT_DIR")"
-RUNTIME_BASE="$HOME/Library/Application Support/Shaggy"
+RUNTIME_BASE="$HOME/Library/Application Support/RUFUS"
 RUNTIME_DIR="$RUNTIME_BASE/runtime"
-LAUNCH_HELPER="$RUNTIME_BASE/launch_shaggy.sh"
+LAUNCH_HELPER="$RUNTIME_BASE/launch_rufus.sh"
 
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
-PLIST_PATH="$LAUNCH_AGENT_DIR/com.shaggy.agent.plist"
+PLIST_PATH="$LAUNCH_AGENT_DIR/com.rufus.agent.plist"
 RUN_SCRIPT="$RUNTIME_DIR/scripts/run_service.sh"
 LOG_DIR="$RUNTIME_DIR/data/logs"
-NEW_LABEL="com.shaggy.agent"
-LEGACY_LABEL="com.juancho.shaggy"
+NEW_LABEL="com.rufus.agent"
 
 mkdir -p "$LAUNCH_AGENT_DIR" "$LOG_DIR" "$RUNTIME_BASE"
 
@@ -42,7 +41,6 @@ set -euo pipefail
 APP_URL='http://localhost:8000'
 HEALTH_URL='http://localhost:8000/health'
 PRIMARY_LABEL='$NEW_LABEL'
-LEGACY_LABEL='$LEGACY_LABEL'
 PLIST_PATH='$PLIST_PATH'
 
 if ! curl -sf "\$HEALTH_URL" >/dev/null 2>&1; then
@@ -52,8 +50,7 @@ if ! curl -sf "\$HEALTH_URL" >/dev/null 2>&1; then
     launchctl enable "gui/\$(id -u)/\$PRIMARY_LABEL" 2>/dev/null || true
   }
 
-  launchctl kickstart -k "gui/\$(id -u)/\$PRIMARY_LABEL" 2>/dev/null || \
-  launchctl kickstart -k "gui/\$(id -u)/\$LEGACY_LABEL" 2>/dev/null || true
+  launchctl kickstart -k "gui/\$(id -u)/\$PRIMARY_LABEL" 2>/dev/null || true
 
   for _ in {1..25}; do
     if curl -sf "\$HEALTH_URL" >/dev/null 2>&1; then
@@ -124,7 +121,7 @@ cleanup_legacy_pattern() {
 }
 
 cleanup_legacy_pattern "$LAUNCH_AGENT_DIR"/com.*shag*.plist
-cleanup_legacy_pattern "$LAUNCH_AGENT_DIR"/com.shaggy*.plist
+cleanup_legacy_pattern "$LAUNCH_AGENT_DIR"/com.*rufus*.plist
 
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"

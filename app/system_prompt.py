@@ -89,6 +89,10 @@ def build_system_prompt(
             "capaz de programarlo y no digas que no puedes hacerlo."
         ),
         (
+            "Si el usuario pide guardar memoria personal (ej. 'recuerda que...'), "
+            "actua como asistente capaz de recordar y evita responder con rechazos genericos."
+        ),
+        (
             "Formato de respuesta: usa markdown simple y limpio. "
             "No uses HTML (<table>, <br>, etc.)."
         ),

@@ -1,0 +1,278 @@
+version: 1
+updated_at: 2026-02-27
+
+capabilities:
+  - id: chat_general
+    phase: 1
+    provider: llm_engine
+    summary: Respuesta general sin ejecución de herramientas externas.
+    input_schema:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+    output_schema:
+      type: object
+      required: [response]
+      properties:
+        response:
+          type: string
+    fallback_to: []
+
+  - id: web_search_general
+    phase: 2
+    provider: web_search_engine.search
+    summary: Búsqueda web general para datos dinámicos.
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 2
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 10
+    output_schema:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            required: [title, snippet, url]
+            properties:
+              title: {type: string}
+              snippet: {type: string}
+              url: {type: string}
+    fallback_to: [web_search_news]
+
+  - id: web_search_news
+    phase: 2
+    provider: web_search_engine.search_news
+    summary: Búsqueda de noticias recientes.
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 2
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 10
+    output_schema:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            required: [title, snippet, url]
+            properties:
+              title: {type: string}
+              snippet: {type: string}
+              url: {type: string}
+    fallback_to: [web_search_general]
+
+  - id: get_current_datetime
+    phase: 2
+    provider: internal_clock
+    summary: Obtiene fecha/hora local para preguntas temporales.
+    input_schema:
+      type: object
+      properties: {}
+    output_schema:
+      type: object
+      required: [iso_datetime, human_readable]
+      properties:
+        iso_datetime: {type: string}
+        human_readable: {type: string}
+    fallback_to: []
+
+  - id: reminder_create
+    phase: 1
+    provider: reminder_manager
+    summary: Crea recordatorios desde texto natural.
+    input_schema:
+      type: object
+      required: [text]
+      properties:
+        text: {type: string, minLength: 3}
+    output_schema:
+      type: object
+      required: [id, text, datetime]
+      properties:
+        id: {type: string}
+        text: {type: string}
+        datetime: {type: string}
+    fallback_to: [chat_general]
+
+  - id: reminder_list
+    phase: 1
+    provider: reminder_manager
+    summary: Lista recordatorios activos.
+    input_schema:
+      type: object
+      properties: {}
+    output_schema:
+      type: object
+      required: [reminders]
+      properties:
+        reminders:
+          type: array
+          items: {type: object}
+    fallback_to: []
+
+  - id: reminder_delete
+    phase: 1
+    provider: reminder_manager
+    summary: Elimina recordatorios por ID o por texto.
+    input_schema:
+      type: object
+      properties:
+        id: {type: string}
+        query: {type: string}
+    output_schema:
+      type: object
+      required: [deleted]
+      properties:
+        deleted: {type: boolean}
+        message: {type: string}
+    fallback_to: [reminder_list]
+
+  - id: memory_retrieval
+    phase: 1
+    provider: memory_manager
+    summary: Recupera contexto relevante de memoria vectorial.
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query: {type: string, minLength: 1}
+        n: {type: integer, minimum: 1, maximum: 20}
+    output_schema:
+      type: object
+      required: [context]
+      properties:
+        context: {type: string}
+    fallback_to: []
+
+  - id: memory_store_user_fact
+    phase: 2
+    provider: memory_manager
+    summary: Guarda hechos personales explícitos del usuario en memoria de largo plazo.
+    input_schema:
+      type: object
+      required: [facts]
+      properties:
+        facts:
+          type: array
+          items: {type: string}
+          minItems: 1
+    output_schema:
+      type: object
+      required: [stored_count]
+      properties:
+        stored_count: {type: integer}
+        skipped_duplicates: {type: integer}
+    fallback_to: [memory_store_summary]
+
+  - id: memory_recall_profile
+    phase: 2
+    provider: memory_manager
+    summary: Resume lo que el sistema recuerda del usuario para una consulta explícita.
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query: {type: string}
+    output_schema:
+      type: object
+      required: [response]
+      properties:
+        response: {type: string}
+    fallback_to: [memory_retrieval]
+
+  - id: memory_store_summary
+    phase: 1
+    provider: memory_manager
+    summary: Guarda resumen de conversación útil.
+    input_schema:
+      type: object
+      required: [summary]
+      properties:
+        summary: {type: string, minLength: 1}
+        metadata: {type: object}
+    output_schema:
+      type: object
+      required: [stored]
+      properties:
+        stored: {type: boolean}
+    fallback_to: []
+
+  - id: media_stack_start
+    phase: 1
+    provider: media_stack
+    summary: Arranca Radarr/Prowlarr/Transmission/Jellyfin en background.
+    input_schema:
+      type: object
+      properties: {}
+    output_schema:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string}
+    fallback_to: [media_stack_status]
+
+  - id: media_stack_status
+    phase: 1
+    provider: media_stack
+    summary: Devuelve estado actual del stack multimedia.
+    input_schema:
+      type: object
+      properties: {}
+    output_schema:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string}
+    fallback_to: []
+
+  - id: media_stack_stop
+    phase: 1
+    provider: media_stack
+    summary: Apaga el stack multimedia y limpia procesos asociados.
+    input_schema:
+      type: object
+      properties: {}
+    output_schema:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string}
+    fallback_to: [media_stack_status]
+
+  - id: movie_search_radarr
+    phase: 1
+    provider: radarr_client
+    summary: Busca películas en Radarr para selección en UI.
+    input_schema:
+      type: object
+      required: [title]
+      properties:
+        title: {type: string, minLength: 1}
+    output_schema:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items: {type: object}
+    fallback_to: [chat_general]

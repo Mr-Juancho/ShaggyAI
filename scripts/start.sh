@@ -14,5 +14,5 @@ if [ ! -x "$RUN_SERVICE" ]; then
 fi
 
 echo "=== Agente de IA Local ==="
-echo "Iniciando stack completa (Shaggy + servicios multimedia)..."
+echo "Iniciando stack completa (RUFÜS + servicios multimedia)..."
 exec "$RUN_SERVICE"

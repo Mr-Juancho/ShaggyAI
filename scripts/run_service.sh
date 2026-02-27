@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ejecuta Shaggy como servicio en background para launchd (macOS).
+# Ejecuta RUFÜS como servicio en background para launchd (macOS).
 # - Verifica/Inicia Ollama si no esta activo.
 # - Verifica/Inicia stack multimedia (Radarr, Prowlarr, Transmission, Jellyfin).
 # - Arranca FastAPI del proyecto y queda en foreground (launchd lo supervisa).
@@ -45,7 +45,7 @@ is_port_listening() {
 }
 
 kill_rogue_media_on_8000() {
-  # Si algun servicio multimedia toma :8000, rompe la URL de Shaggy.
+  # Si algun servicio multimedia toma :8000, rompe la URL de RUFÜS.
   local rows=""
   rows="$(lsof -nP -iTCP:8000 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1":"$2}' || true)"
   if [ -z "$rows" ]; then
@@ -388,15 +388,15 @@ fi
 
 # Iniciar servicios multimedia:
 # - Siempre en modo start-stack-only.
-# - En modo full solo si SHAGGY_START_MEDIA_STACK=true.
+# - En modo full solo si RUFUS_START_MEDIA_STACK=true.
 STACK_SHOULD_START=0
 if [ "$START_MEDIA_STACK_ONLY" -eq 1 ]; then
   STACK_SHOULD_START=1
 else
-  STACK_ENABLED_RAW="${SHAGGY_START_MEDIA_STACK:-}"
+  STACK_ENABLED_RAW="${RUFUS_START_MEDIA_STACK:-}"
   if [ -z "$STACK_ENABLED_RAW" ] && [ -f "$PROJECT_DIR/.env" ]; then
     STACK_ENABLED_RAW="$(
-      awk -F= '/^[[:space:]]*SHAGGY_START_MEDIA_STACK[[:space:]]*=/ {
+      awk -F= '/^[[:space:]]*RUFUS_START_MEDIA_STACK[[:space:]]*=/ {
         value=$2
         sub(/^[[:space:]]+/, "", value)
         sub(/[[:space:]]+$/, "", value)
@@ -422,7 +422,7 @@ if [ "$STACK_SHOULD_START" -eq 1 ]; then
   ensure_jellyfin_running || true
   kill_rogue_media_on_8000 || true
 else
-  log "SHAGGY_START_MEDIA_STACK=${STACK_ENABLED_RAW:-0}, se omite autoinicio de stack multimedia"
+  log "RUFUS_START_MEDIA_STACK=${STACK_ENABLED_RAW:-0}, se omite autoinicio de stack multimedia"
 fi
 
 if [ "$START_MEDIA_STACK_ONLY" -eq 1 ]; then

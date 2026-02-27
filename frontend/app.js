@@ -957,4 +957,4 @@ setInterval(checkHealth, 30000);
 // Focus en input
 messageInput.focus();
 
-console.log('Shaggy UI cargada correctamente');
+console.log('RUFÜS UI cargada correctamente');

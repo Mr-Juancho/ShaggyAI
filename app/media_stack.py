@@ -15,9 +15,12 @@ import os
 import re
 import socket
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
 
 from app.config import BASE_DIR, logger
+from app.json_guard import generate_validated_json
 
 MEDIA_SERVICE_PORTS: dict[str, int] = {
     "Radarr": 7878,
@@ -47,6 +50,44 @@ _MEDIA_STOP_VERB_RE = re.compile(
     r"cierra|cerrar|termina|terminar|mata|matar|kill|apaga)\b",
     flags=re.IGNORECASE,
 )
+_MEDIA_FOLLOWUP_START_RE = re.compile(
+    r"^\s*(?:ya\s+)?(?:act[ií]va(?:lo)?|act[ií]var(?:lo)?|"
+    r"inicia(?:lo)?|iniciar(?:lo)?|arranca(?:lo)?|arrancar(?:lo)?|"
+    r"enci[eé]nde(?:lo)?|encender(?:lo)?|prende(?:lo)?|prender(?:lo)?|"
+    r"levanta(?:lo)?|levantar(?:lo)?|habilita(?:lo)?|habilitar(?:lo)?)\s*[.!?¡¿]*\s*$",
+    flags=re.IGNORECASE,
+)
+_MEDIA_FOLLOWUP_STOP_RE = re.compile(
+    r"^\s*(?:ya\s+)?(?:ap[aá]ga(?:lo)?|apagar(?:lo)?|desactiva(?:lo)?|desactivar(?:lo)?|"
+    r"det[eé]n(?:lo)?|detener(?:lo)?|cierra(?:lo)?|cerrar(?:lo)?|"
+    r"termina(?:lo)?|terminar(?:lo)?|m[aá]ta(?:lo)?|matar(?:lo)?)\s*[.!?¡¿]*\s*$",
+    flags=re.IGNORECASE,
+)
+_MEDIA_CONTEXT_HINT_RE = re.compile(
+    r"\b(protocolo|stack|pel[ií]culas?|cine|media|radarr|prowlarr|transmission|jellyfin)\b|"
+    r"Radarr:|Prowlarr:|Transmission:|Jellyfin:",
+    flags=re.IGNORECASE,
+)
+_MEDIA_STACK_EXPLICIT_HINT_RE = re.compile(
+    r"\b(protocolo|stack|servicios?|radarr|prowlarr|transmission|jellyfin|"
+    r"modo\s+pel[ií]culas?|stack\s+de\s+pel[ií]culas?)\b",
+    flags=re.IGNORECASE,
+)
+_MEDIA_SEMANTIC_ACTION_HINT_RE = re.compile(
+    r"\b(activa(?:r)?(?:lo)?|inicia(?:r)?(?:lo)?|arranca(?:r)?(?:lo)?|"
+    r"enciende(?:r)?(?:lo)?|prende(?:r)?(?:lo)?|levanta(?:r)?(?:lo)?|"
+    r"habilita(?:r)?(?:lo)?|apaga(?:r)?(?:lo)?|desactiva(?:r)?(?:lo)?|"
+    r"det[eé]n(?:er)?(?:lo)?|cierra(?:r)?(?:lo)?|termina(?:r)?(?:lo)?|"
+    r"estado|status|estatus|reinicia(?:r)?(?:lo)?|reactiva(?:r)?(?:lo)?|"
+    r"encendido|apagado|arriba|caido|caído|"
+    r"ponlo|ponla|hazlo|d[eé]jalo)\b",
+    flags=re.IGNORECASE,
+)
+_SHORT_IMPERATIVE_RE = re.compile(
+    r"^\s*(?:ok[, ]+)?(?:ya\s+)?(?:hazlo|dale|listo|ponlo|ponla|enciendelo|enciéndelo|"
+    r"apágalo|apagalo|actívalo|activalo|deténlo|detenlo|reinícialo|reinicialo)\s*[.!?¡¿]*\s*$",
+    flags=re.IGNORECASE,
+)
 _NEGATED_START_RE = re.compile(
     r"\b(no|nunca)\b.{0,10}\b(inicies?|arranques?|actives?|enciendas?|"
     r"levantes?|prendas?|habilites?)\b",
@@ -57,6 +98,14 @@ _NEGATED_STOP_RE = re.compile(
     r"termines?|mates?)\b",
     flags=re.IGNORECASE,
 )
+
+
+class MediaStackSemanticDecision(BaseModel):
+    """Salida estructurada para clasificador semántico del stack multimedia."""
+
+    action: str = "none"  # start | stop | status | none
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    rationale: str = ""
 
 
 def _is_local_port_open(port: int, timeout_seconds: float = 0.35) -> bool:
@@ -113,6 +162,144 @@ def looks_like_media_stack_stop_request(message: str) -> bool:
     if _NEGATED_STOP_RE.search(text):
         return False
     return bool(_MEDIA_STOP_VERB_RE.search(text) and _MEDIA_SCOPE_RE.search(text))
+
+
+def _has_recent_media_stack_context(recent_messages: Optional[list[str]], max_items: int = 6) -> bool:
+    """Evalúa si hay contexto reciente del protocolo multimedia en el historial."""
+    if not recent_messages:
+        return False
+    inspected = 0
+    for raw in reversed(recent_messages):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        if _MEDIA_CONTEXT_HINT_RE.search(text):
+            return True
+        inspected += 1
+        if inspected >= max_items:
+            break
+    return False
+
+
+def looks_like_media_stack_semantic_candidate(
+    message: str,
+    recent_messages: Optional[list[str]] = None,
+) -> bool:
+    """
+    Heurística de gate para decidir cuándo invocar clasificación semántica.
+    Evita costo/latencia en mensajes que claramente no son del stack multimedia.
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+
+    has_media_words = bool(_MEDIA_STACK_EXPLICIT_HINT_RE.search(text))
+    if has_media_words:
+        return True
+
+    has_recent_context = _has_recent_media_stack_context(recent_messages)
+    if not has_recent_context:
+        return False
+
+    if _SHORT_IMPERATIVE_RE.match(text):
+        return True
+
+    token_count = len(re.findall(r"[a-zA-Z0-9áéíóúñü]+", text))
+    return token_count <= 10 and bool(_MEDIA_SEMANTIC_ACTION_HINT_RE.search(text))
+
+
+def looks_like_media_stack_followup_start_request(
+    message: str,
+    recent_messages: Optional[list[str]] = None,
+) -> bool:
+    """
+    Detecta follow-ups anafóricos ("actívalo") cuando el contexto reciente
+    indica que el usuario venía hablando del protocolo de películas.
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if _NEGATED_START_RE.search(text):
+        return False
+    if not _MEDIA_FOLLOWUP_START_RE.match(text):
+        return False
+    return _has_recent_media_stack_context(recent_messages)
+
+
+def looks_like_media_stack_followup_stop_request(
+    message: str,
+    recent_messages: Optional[list[str]] = None,
+) -> bool:
+    """Detecta follow-ups de apagado ("apágalo") con contexto multimedia."""
+    text = (message or "").strip()
+    if not text:
+        return False
+    if _NEGATED_STOP_RE.search(text):
+        return False
+    if not _MEDIA_FOLLOWUP_STOP_RE.match(text):
+        return False
+    return _has_recent_media_stack_context(recent_messages)
+
+
+async def infer_media_stack_action_semantic(
+    message: str,
+    recent_messages: Optional[list[str]],
+    llm_engine: Any,
+    min_confidence: float = 0.62,
+) -> MediaStackSemanticDecision:
+    """
+    Clasifica intención del protocolo multimedia por semántica.
+    Devuelve action=start|stop|status|none y confidence.
+    """
+    if not llm_engine or not looks_like_media_stack_semantic_candidate(message, recent_messages):
+        return MediaStackSemanticDecision(action="none", confidence=0.0)
+
+    history_lines = "\n".join(
+        f"- {line[:180]}"
+        for line in (recent_messages or [])[-6:]
+    ) or "- (sin historial relevante)"
+
+    system_prompt = (
+        "Eres un clasificador semantico para control de un stack multimedia local. "
+        "Debes responder SOLO JSON valido."
+    )
+    user_prompt = (
+        "Clasifica la intencion del usuario respecto al stack multimedia "
+        "(Radarr, Prowlarr, Transmission, Jellyfin).\n"
+        "Devuelve accion exacta: start, stop, status o none.\n"
+        "Usa historial para resolver anaforas como 'activalo', 'ponlo en marcha', "
+        "'apagalo', 'como va eso'.\n"
+        f"Mensaje actual: {message}\n"
+        f"Historial reciente:\n{history_lines}\n"
+        "Schema requerido:\n"
+        "{\n"
+        '  "action": "start|stop|status|none",\n'
+        '  "confidence": 0.0,\n'
+        '  "rationale": "breve"\n'
+        "}"
+    )
+
+    parsed, trace = await generate_validated_json(
+        llm_engine=llm_engine,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        schema_model=MediaStackSemanticDecision,
+        max_retries=2,
+    )
+    if not parsed:
+        if trace.last_error:
+            logger.warning(f"Clasificador semantico media stack invalido: {trace.last_error}")
+        return MediaStackSemanticDecision(action="none", confidence=0.0)
+
+    action = (parsed.action or "").strip().lower()
+    if action not in {"start", "stop", "status", "none"}:
+        action = "none"
+
+    confidence = float(parsed.confidence or 0.0)
+    if action != "none" and confidence < min_confidence:
+        return MediaStackSemanticDecision(action="none", confidence=confidence, rationale=parsed.rationale)
+
+    return MediaStackSemanticDecision(action=action, confidence=confidence, rationale=parsed.rationale)
 
 
 def _format_status_line(status: dict[str, bool]) -> str:

@@ -1,4 +1,4 @@
-# Shaggy - Agente de IA Local
+# RUFÜS - Agente de IA Local
 
 Asistente personal en local con:
 - FastAPI (API + interfaz web)
@@ -6,6 +6,40 @@ Asistente personal en local con:
 - Memoria persistente con ChromaDB
 - Bot de Telegram
 - Recordatorios y busqueda web
+
+## Plan Maestro (mejoras integradas)
+
+Se incorporaron mejoras del plan por fases:
+
+- Fase 1:
+  - `PRODUCT_SCOPE.md` (contrato de producto con capacidades permitidas).
+  - `app/CAPABILITIES.yaml` (registry con schema de entrada/salida y fallback por capability).
+- Fase 2:
+  - `app/semantic_router.py` (clasificador semantico con salida JSON estricta).
+  - `app/time_policy.py` (inyeccion obligatoria de fecha/hora para intenciones temporales).
+- Fase 3:
+  - `app/json_guard.py` (pipeline Generacion -> Validacion schema -> Reparacion, max 2 reintentos).
+  - Escalera de fallback web integrada en `app/main.py` (primaria -> alternativa -> general -> aclaracion).
+- Fase 4:
+  - `app/response_verifier.py` (verificador final de coherencia temporal y uso de fuentes).
+  - `app/evals.py` (metricas y regla de gateo por SLO).
+
+## Pruebas por fase
+
+Se incluyen tests unitarios en `tests/`:
+
+- `tests/test_phase1_scope_registry.py`
+- `tests/test_phase2_semantic_router.py`
+- `tests/test_phase2_memory_semantic.py`
+- `tests/test_phase3_json_pipeline.py`
+- `tests/test_phase4_verifier_evals.py`
+
+Ejecutar:
+
+```bash
+cd mi-agente-ia
+PYTHONPATH=. PYTHONPYCACHEPREFIX=/tmp/pythoncache python3 -m unittest discover -s tests -v
+```
 
 ## 1) Prerequisitos
 
@@ -58,15 +92,15 @@ Opcion B:
 bash scripts/start.sh
 ```
 
-Por defecto, Shaggy inicia solo (sin stack multimedia).
-Si quieres autoiniciar Radarr/Prowlarr/Transmission/Jellyfin junto con Shaggy:
+Por defecto, RUFÜS inicia solo (sin stack multimedia).
+Si quieres autoiniciar Radarr/Prowlarr/Transmission/Jellyfin junto con RUFÜS:
 
 ```bash
-export SHAGGY_START_MEDIA_STACK=true
+export RUFUS_START_MEDIA_STACK=true
 ```
 
 Modo recomendado (manual):
-- Escribe en el chat de Shaggy: `inicia protocolo peliculas`
+- Escribe en el chat de RUFÜS: `inicia protocolo peliculas`
 - Se levantan en segundo plano (headless) sin abrir sus webs.
 - Puedes consultar estado con: `estado del protocolo peliculas`
 - Para detenerlo y matar procesos: `apaga protocolo peliculas`
@@ -93,10 +127,10 @@ Puedes cambiar:
 python scripts/create_shortcut.py
 ```
 
-Genera un acceso directo en el escritorio:
-- Windows: `.bat` y `.url`
-- macOS: `.command`
-- Linux: `.desktop`
+Genera un acceso directo del launcher:
+- Windows: en el Escritorio (`.bat` y `.url`)
+- macOS: en `~/Library/Application Support/RUFUS/launcher` (`.app` y `.command`, sin ensuciar Escritorio)
+- Linux: en el Escritorio (`.desktop`)
 
 ## 7) Inicio automatico con el sistema
 

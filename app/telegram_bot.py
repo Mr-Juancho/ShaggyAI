@@ -339,7 +339,7 @@ class TelegramBot:
             return
 
         await update.message.reply_text(
-            "Hola! Soy *Shaggy*, tu asistente personal de IA.\n\n"
+            "Hola! Soy *RUFÜS*, tu asistente personal de IA.\n\n"
             "Puedes hablarme directamente o usar estos comandos:\n"
             "/remember [texto] — Guardar informacion\n"
             "/profile — Ver tu perfil guardado\n"
