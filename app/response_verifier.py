@@ -45,11 +45,29 @@ def _domains_from_results(results: list[dict[str, str]], max_domains: int = 2) -
     return domains
 
 
+def _urls_from_results(results: list[dict[str, str]], max_urls: int = 2) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for result in results:
+        url = (result.get("url", "") or "").strip()
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+        if len(urls) >= max_urls:
+            break
+    return urls
+
+
 def verify_response(
     response_text: str,
     route: Any,
     web_results: list[dict[str, str]] | None = None,
     datetime_payload: dict[str, str] | None = None,
+    append_sources_block: bool = True,
 ) -> VerificationResult:
     """Applies lightweight quality checks before returning response to user."""
     web_results = web_results or []
@@ -75,11 +93,11 @@ def verify_response(
         lines = [line for line in text.splitlines() if not SOURCE_LINE_RE.search(line)]
         text = "\n".join(lines).strip()
 
-    if web_results and not SOURCE_LINE_RE.search(text):
-        domains = _domains_from_results(web_results)
-        if domains:
+    if append_sources_block and web_results and not SOURCE_LINE_RE.search(text):
+        urls = _urls_from_results(web_results)
+        if urls:
             issues.append("sources_appended")
-            source_lines = ["Fuentes:", *[f"- {domain}" for domain in domains]]
+            source_lines = ["Fuentes:", *[f"- {url}" for url in urls]]
             text = f"{text}\n\n" + "\n".join(source_lines)
 
     if getattr(route, "intent", "") == "web_search" and not web_results and GENERIC_FAILURE_RE.search(text):

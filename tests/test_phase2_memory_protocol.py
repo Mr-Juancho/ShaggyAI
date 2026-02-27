@@ -3,10 +3,12 @@ import unittest
 from app.memory_protocol import (
     MEMORY_PURGE_ACTIVATION_PHRASE,
     MEMORY_PURGE_CONFIRMATION_WORD,
+    RESTART_RUFUS_ACTIVATION_PHRASE,
     is_memory_purge_activation_command,
     is_memory_purge_cancel_word,
     is_memory_purge_confirmation_word,
     is_protocols_overview_query,
+    is_restart_rufus_command,
 )
 
 
@@ -32,6 +34,16 @@ class MemoryProtocolGrammarTests(unittest.TestCase):
         self.assertTrue(is_protocols_overview_query("Que protocolos tienes?"))
         self.assertTrue(is_protocols_overview_query("Tienes un protocolo de borrado?"))
         self.assertFalse(is_protocols_overview_query(MEMORY_PURGE_ACTIVATION_PHRASE))
+
+    def test_restart_protocol_activation_aliases(self):
+        self.assertTrue(is_restart_rufus_command(RESTART_RUFUS_ACTIVATION_PHRASE))
+        self.assertTrue(is_restart_rufus_command("Activa el protocolo de reinicio RUFÜS"))
+        self.assertTrue(is_restart_rufus_command("ejecuta el protocolo reinicio rufus"))
+        self.assertFalse(is_restart_rufus_command("reinicia rufus"))
+        self.assertFalse(is_restart_rufus_command("estado del protocolo reinicio rufus"))
+
+    def test_overview_query_does_not_hijack_restart_command(self):
+        self.assertFalse(is_protocols_overview_query("activa el protocolo de reinicio rufus"))
 
 
 if __name__ == "__main__":

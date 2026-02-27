@@ -6,51 +6,87 @@
     <title>RUFÜS</title>
     <link rel="icon" type="image/png" href="/static/rufus.png?v=20260227_2">
     <link rel="apple-touch-icon" href="/static/rufus.png?v=20260227_2">
-    <link rel="stylesheet" href="/static/style.css?v=20260226_1">
+    <link rel="stylesheet" href="/static/style.css?v=20260227_34">
 </head>
 <body>
     <!-- Header -->
     <header class="header">
         <div class="header-content">
             <div class="header-left">
-                <div class="avatar">
-                    <img src="/static/rufus.png?v=20260227_2" alt="RUFÜS">
-                </div>
-                <div class="header-info">
-                    <h1 class="header-name">RUFÜS</h1>
-                    <div class="status">
-                        <span class="status-dot" id="statusDot"></span>
-                        <span class="status-text" id="statusText">Conectando...</span>
-                    </div>
-                </div>
+                <h1 class="header-name">RUFÜS</h1>
+                <span class="status-dot" id="statusDot"></span>
             </div>
             <button class="theme-toggle" id="themeToggle" title="Cambiar tema" aria-label="Cambiar tema">
-                <svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/>
                     <line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
                     <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/>
                     <line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
                     <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
                 </svg>
-                <svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
                 </svg>
             </button>
         </div>
     </header>
 
-    <!-- Chat area -->
-    <main class="chat-container" id="chatContainer">
-        <div class="chat-messages" id="chatMessages">
-            <!-- Mensaje de bienvenida -->
-            <div class="message agent fade-in">
-                <div class="bubble">Hola, soy <strong>RUFÜS</strong>. ¿En qué te puedo ayudar?</div>
+    <!-- Landing screen (antes del primer mensaje) -->
+    <div class="landing-screen" id="landingScreen">
+        <div class="landing-content">
+            <div class="landing-greeting" id="landingGreeting"></div>
+            <div class="landing-input-wrapper">
+                <div class="input-container landing-input">
+                    <textarea
+                        id="messageInputLanding"
+                        placeholder="Escribe un mensaje..."
+                        rows="1"
+                    ></textarea>
+                    <div class="input-actions">
+                        <div class="model-picker">
+                            <button class="model-picker-btn" id="modelPickerBtnLanding" title="Modelo y pensamiento" aria-label="Modelo y pensamiento">
+                                <span class="model-picker-btn-main">GPT:20B</span>
+                            </button>
+                            <div class="model-picker-menu" id="modelPickerMenuLanding"></div>
+                        </div>
+                        <!-- Botón herramientas -->
+                        <button class="tools-btn" id="toolsBtnLanding" title="Herramientas" aria-label="Herramientas">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="5" y1="8" x2="19" y2="8"></line>
+                                <circle cx="9" cy="8" r="1.6"></circle>
+                                <line x1="5" y1="16" x2="19" y2="16"></line>
+                                <circle cx="15" cy="16" r="1.6"></circle>
+                            </svg>
+                        </button>
+                        <button class="send-btn" id="sendBtnLanding" title="Enviar" aria-label="Enviar mensaje">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="12" y1="18" x2="12" y2="7"></line>
+                                <polyline points="8 11 12 7 16 11"></polyline>
+                            </svg>
+                        </button>
+                        <!-- Menú herramientas -->
+                        <div class="tools-menu" id="toolsMenuLanding">
+                            <button class="tools-menu-item" id="toggleNewsLanding">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M19 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v1m2 13a2 2 0 0 1-2-2V7m2 13a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-2"/>
+                                </svg>
+                                <span>Noticias</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Chat area (oculto inicialmente) -->
+    <main class="chat-container hidden" id="chatContainer">
+        <div class="chat-messages" id="chatMessages">
         </div>
     </main>
 
-    <!-- Input area -->
-    <footer class="input-area">
+    <!-- Input area (oculto inicialmente) -->
+    <footer class="input-area hidden" id="inputArea">
         <div class="input-container">
             <textarea
                 id="messageInput"
@@ -58,15 +94,52 @@
                 rows="1"
                 autofocus
             ></textarea>
-            <button class="send-btn" id="sendBtn" title="Enviar" aria-label="Enviar mensaje">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="22" y1="2" x2="11" y2="13"/>
-                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                </svg>
-            </button>
+            <div class="input-actions">
+                <div class="model-picker">
+                    <button class="model-picker-btn" id="modelPickerBtn" title="Modelo y pensamiento" aria-label="Modelo y pensamiento">
+                        <span class="model-picker-btn-main">GPT:20B</span>
+                    </button>
+                    <div class="model-picker-menu" id="modelPickerMenu"></div>
+                </div>
+                <!-- Botón herramientas -->
+                <button class="tools-btn" id="toolsBtn" title="Herramientas" aria-label="Herramientas">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="5" y1="8" x2="19" y2="8"></line>
+                        <circle cx="9" cy="8" r="1.6"></circle>
+                        <line x1="5" y1="16" x2="19" y2="16"></line>
+                        <circle cx="15" cy="16" r="1.6"></circle>
+                    </svg>
+                </button>
+                <button class="send-btn" id="sendBtn" title="Enviar" aria-label="Enviar mensaje">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="18" x2="12" y2="7"></line>
+                        <polyline points="8 11 12 7 16 11"></polyline>
+                    </svg>
+                </button>
+                <!-- Menú herramientas -->
+                <div class="tools-menu" id="toolsMenu">
+                    <button class="tools-menu-item" id="toggleNews">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M19 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v1m2 13a2 2 0 0 1-2-2V7m2 13a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-2"/>
+                        </svg>
+                        <span>Noticias</span>
+                    </button>
+                </div>
+            </div>
         </div>
     </footer>
 
-    <script src="/static/app.js?v=20260226_1"></script>
+    <!-- Panel de noticias -->
+    <div class="news-panel hidden" id="newsPanel">
+        <div class="news-panel-header">
+            <span class="news-panel-title">Noticias</span>
+            <button class="news-panel-close" id="newsPanelClose">&times;</button>
+        </div>
+        <div class="news-panel-content" id="newsPanelContent">
+            <p class="news-placeholder">Cargando noticias...</p>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=20260227_34"></script>
 </body>
 </html>

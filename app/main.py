@@ -4,10 +4,13 @@ Integra chat, memoria, Telegram, recordatorios y busqueda web.
 """
 
 import asyncio
+import os
 import re
+import subprocess
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta
 from html import unescape
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -44,10 +47,12 @@ from app.memory_protocol import (
     MEMORY_PURGE_ACTIVATION_PHRASE,
     MEMORY_PURGE_CANCEL_WORD,
     MEMORY_PURGE_CONFIRMATION_WORD,
+    RESTART_RUFUS_ACTIVATION_PHRASE,
     is_memory_purge_activation_command,
     is_memory_purge_cancel_word,
     is_memory_purge_confirmation_word,
     is_protocols_overview_query,
+    is_restart_rufus_command,
 )
 from app.memory_semantic import (
     extract_memory_facts_fallback,
@@ -100,6 +105,8 @@ class ChatRequest(BaseModel):
     message: str
     user_id: str = "default"
     source: str = "api"  # api, desktop, telegram, test
+    model: Optional[str] = None
+    think_mode: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -107,6 +114,38 @@ class ChatResponse(BaseModel):
 
     response: str
     movie: Optional[dict[str, Any]] = None  # Datos de película (Fase 6.5)
+    model_used: Optional[str] = None
+    think_mode_used: Optional[str] = None
+    sources: list[dict[str, str]] = Field(default_factory=list)
+
+
+class LLMModelOption(BaseModel):
+    """Modelo disponible para selector de frontend."""
+
+    name: str
+    display_name: str
+    supports_thinking: bool = False
+    supports_think_levels: bool = False
+    think_mode_type: str = "none"
+    is_selected: bool = False
+
+
+class LLMThinkModeOption(BaseModel):
+    """Modo de pensamiento mostrado en selector."""
+
+    id: str
+    label: str
+    description: str
+
+
+class LLMCatalogResponse(BaseModel):
+    """Catalogo de modelos + modos para selector frontend."""
+
+    current_model: str
+    current_think_mode: str
+    models: list[LLMModelOption]
+    gpt_oss_think_modes: list[LLMThinkModeOption]
+    standard_think_modes: list[LLMThinkModeOption]
 
 
 class RememberRequest(BaseModel):
@@ -158,6 +197,7 @@ class HealthResponse(BaseModel):
 conversation_history: dict[str, list[dict[str, str]]] = {}
 pending_reminder_by_user: dict[str, dict[str, str]] = {}
 pending_memory_purge_by_user: dict[str, dict[str, str]] = {}
+latest_web_sources_by_user: dict[str, list[dict[str, str]]] = {}
 CANONICAL_USER_ID = "primary_user"
 USER_ID_ALIASES: set[str] = {"desktop_user"}
 if str(TELEGRAM_USER_ID or "").strip():
@@ -391,6 +431,40 @@ WEB_EXPLICIT_REQUEST_RE = re.compile(
     r"\b(en\s+(?:la\s+)?(?:web|internet|google))\b",
     flags=re.IGNORECASE,
 )
+THINK_MODE_ALLOWED_VALUES = {
+    "low",
+    "medium",
+    "high",
+    "on",
+    "off",
+    "true",
+    "false",
+    "1",
+    "0",
+}
+
+
+def _friendly_model_display_name(model_name: str) -> str:
+    """Convierte nombres tecnicos de modelos a etiquetas cortas para UI."""
+    raw = str(model_name or "").strip()
+    normalized = raw.lower()
+    if not raw:
+        return "Modelo"
+
+    if normalized == "gpt-oss:20b":
+        return "GPT:20B"
+    if normalized.startswith("qwen3-coder:30b"):
+        return "QWEN:30B"
+    if normalized.startswith("qwen2.5-coder:14b-instruct"):
+        return "QWEN:14B"
+    if normalized.startswith("mfdoom"):
+        return "DEEPSEEK:16B"
+    if normalized.startswith("mistral-nemo"):
+        return "MISTRAL:12B"
+    if normalized.startswith("llama3.1:8b") or normalized.startswith("llam3.1:8b"):
+        return "LLAMA:8B"
+
+    return raw
 
 
 def _normalize_web_query(text: str) -> str:
@@ -409,6 +483,26 @@ def _normalize_web_query(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return cleaned.strip(" \t\n\r?¡!.,;:")
+
+
+def _normalize_requested_model(model_name: Optional[str]) -> Optional[str]:
+    """Limpia el nombre de modelo pedido por frontend."""
+    raw = str(model_name or "").strip()
+    if not raw:
+        return None
+    if len(raw) > 120:
+        return None
+    return raw
+
+
+def _normalize_requested_think_mode(think_mode: Optional[str]) -> Optional[str]:
+    """Normaliza modo de pensamiento recibido por frontend."""
+    normalized = str(think_mode or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized not in THINK_MODE_ALLOWED_VALUES:
+        return None
+    return normalized
 
 
 def _channel_prompt_addendum(source: str) -> str:
@@ -541,6 +635,58 @@ def _source_markdown_link(url: str) -> str:
     return safe_url
 
 
+def _normalize_web_source_url(value: str) -> str:
+    """Normaliza URL de fuente y descarta entradas no validas."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw.lstrip('/')}"
+    try:
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        if not parsed.netloc:
+            return ""
+        return parsed.geturl()
+    except Exception:
+        return ""
+
+
+def _build_source_entries(results: list[dict[str, str]], max_sources: int = 6) -> list[dict[str, str]]:
+    """Construye fuentes exactas (URL + etiqueta) para frontend."""
+    entries: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for result in results:
+        url = _normalize_web_source_url(result.get("url", ""))
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+
+        title = _sanitize_web_text(result.get("title", ""), max_length=120)
+        domain = ""
+        try:
+            domain = urlparse(url).netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+        except Exception:
+            domain = ""
+
+        label = title or domain or url
+        entry = {"url": url, "label": label}
+        if domain:
+            entry["domain"] = domain
+        entries.append(entry)
+        if len(entries) >= max_sources:
+            break
+
+    return entries
+
+
 def _format_web_results_for_user(query: str, results: list[dict[str, str]], max_results: int = 5) -> str:
     """Da formato legible y consistente a resultados web para mostrar al usuario."""
     safe_query = _sanitize_web_text(query, max_length=120) or "tu consulta"
@@ -575,29 +721,23 @@ def _append_telegram_sources_block(text: str, results: list[dict[str, str]], max
         return text
 
     sources: list[str] = []
-    seen_domains: set[str] = set()
+    seen_urls: set[str] = set()
     for result in results:
-        url = (result.get("url", "") or "").strip()
+        url = _normalize_web_source_url(result.get("url", ""))
         if not url:
             continue
-        try:
-            parsed = urlparse(url)
-            domain = (parsed.netloc or "").lower()
-            if domain.startswith("www."):
-                domain = domain[4:]
-            if not domain or domain in seen_domains:
-                continue
-            seen_domains.add(domain)
-            sources.append(domain)
-            if len(sources) >= max_sources:
-                break
-        except Exception:
+        key = url.lower()
+        if key in seen_urls:
             continue
+        seen_urls.add(key)
+        sources.append(url)
+        if len(sources) >= max_sources:
+            break
 
     if not sources:
         return text
 
-    source_lines = ["Fuentes:", *[f"- {domain}" for domain in sources]]
+    source_lines = ["Fuentes:", *[f"- {source_url}" for source_url in sources]]
     return f"{text.strip()}\n\n" + "\n".join(source_lines)
 
 
@@ -673,8 +813,104 @@ def _build_protocols_overview_response() -> str:
         "- Protocolo de borrado total de memoria:\n"
         f"  - activar (frase exacta): '{MEMORY_PURGE_ACTIVATION_PHRASE}'\n"
         f"  - confirmar (palabra exacta): '{MEMORY_PURGE_CONFIRMATION_WORD}'\n"
-        f"  - cancelar: '{MEMORY_PURGE_CANCEL_WORD}'"
+        f"  - cancelar: '{MEMORY_PURGE_CANCEL_WORD}'\n"
+        "- Protocolo reinicio RUFÜS:\n"
+        f"  - activar (frase exacta): '{RESTART_RUFUS_ACTIVATION_PHRASE}'"
     )
+
+
+def _resolve_restart_rufus_script_path() -> Optional[Path]:
+    """Resuelve el script de reinicio sin depender de rutas personales del host."""
+    env_override = (os.getenv("RUFUS_RESTART_SCRIPT_PATH") or "").strip()
+    candidates: list[Path] = []
+
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    # Ruta local del proyecto/runtine donde corre este proceso.
+    local_project_root = Path(__file__).resolve().parent.parent
+    candidates.append(local_project_root / "scripts" / "install_autostart_macos.sh")
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _tail_text_file(path: Path, max_chars: int = 900) -> str:
+    """Lee el final de un archivo de texto sin fallar si no existe."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    return content[-max_chars:].strip()
+
+
+async def _handle_restart_rufus_protocol() -> str:
+    """Lanza el protocolo de reinicio y reporta errores inmediatos reales."""
+    script_path = _resolve_restart_rufus_script_path()
+    if script_path is None:
+        logger.error("[protocolo-reinicio] Script no encontrado en rutas conocidas.")
+        return (
+            "No pude ejecutar el reinicio porque no encontre el script.\n"
+            "Si quieres, lo revisamos juntos con RUFUS_RESTART_SCRIPT_PATH."
+        )
+
+    project_root = script_path.parent.parent
+    log_path = Path("/tmp/rufus_restart_protocol.log")
+    env = os.environ.copy()
+    env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as log_file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"\n[{timestamp}] Ejecutando restart protocol...\n".encode("utf-8"))
+            log_file.flush()
+
+            proc = subprocess.Popen(
+                ["bash", str(script_path)],
+                cwd=str(project_root),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+            )
+
+        try:
+            exit_code = proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            exit_code = None
+
+        if exit_code not in (None, 0):
+            err_tail = _tail_text_file(log_path)
+            logger.error(
+                "[protocolo-reinicio] Fallo inmediato (exit %s). log tail: %s",
+                exit_code,
+                err_tail[-280:],
+            )
+            return (
+                "Intente reiniciar RUFÜS, pero fallo al arrancar.\n"
+                f"Codigo: {exit_code}.\n"
+                f"Detalle tecnico (log): {err_tail[-500:] if err_tail else 'sin salida'}"
+            )
+
+        logger.info(
+            "[protocolo-reinicio] Lanzado en background: bash %s | log: %s",
+            script_path,
+            log_path,
+        )
+        return (
+            "Perfecto, ya active el protocolo de reinicio de RUFÜS.\n"
+            "En unos segundos deberia volver a quedar operativo.\n"
+            f"Si ves algo raro, reviso contigo este log: {log_path}"
+        )
+    except Exception as exc:
+        logger.error("[protocolo-reinicio] Excepcion al lanzar en background: %s", exc)
+        return (
+            "Se produjo un error al intentar reiniciar RUFÜS.\n"
+            f"Detalle tecnico: {exc}"
+        )
 
 
 def _handle_protocols_overview_query(message: str) -> Optional[str]:
@@ -2052,7 +2288,13 @@ async def _handle_media_stack_action(
     )
 
 
-async def process_chat_message(message: str, user_id: str, source: str = "api") -> str:
+async def process_chat_message(
+    message: str,
+    user_id: str,
+    source: str = "api",
+    model: Optional[str] = None,
+    think_mode: Optional[str] = None,
+) -> str:
     """
     Flujo principal de chat compartido por API y Telegram.
     """
@@ -2076,7 +2318,11 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
     skip_memory_autostore = False
 
     pending_memory_purge = _get_pending_memory_purge(user_id)
-    if pending_memory_purge:
+    if is_restart_rufus_command(message):
+        _clear_pending_memory_purge(user_id)
+        response_text = await _handle_restart_rufus_protocol()
+        skip_memory_autostore = True
+    elif pending_memory_purge:
         if _is_memory_purge_cancellation(message):
             _clear_pending_memory_purge(user_id)
             response_text = "Listo, cancele el protocolo de borrado de memoria."
@@ -2267,6 +2513,8 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
                         response_text = await llm_engine.generate_response(
                             messages=model_history,
                             system_prompt=system_prompt,
+                            model=model,
+                            think_mode=think_mode,
                         )
 
                         # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
@@ -2331,6 +2579,8 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
                             retry_response = await llm_engine.generate_response(
                                 messages=_sanitize_history_for_generation(history),
                                 system_prompt=retry_prompt,
+                                model=model,
+                                think_mode=think_mode,
                             )
                             if retry_response.strip() and not _is_generic_refusal(retry_response):
                                 response_text = retry_response
@@ -2341,11 +2591,15 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
                             response_text = f"{response_text}\n\n{auto_reminder_note}"
 
     response_text = _normalize_response_format(response_text)
+    source_entries = _build_source_entries(web_results)
+    latest_web_sources_by_user[user_id] = source_entries
+
     verification = verify_response(
         response_text=response_text,
         route=route_decision,
         web_results=web_results,
         datetime_payload=datetime_payload,
+        append_sources_block=(source == "telegram"),
     )
     response_text = verification.response
     if verification.issues:
@@ -2549,10 +2803,19 @@ async def _extract_movie_title(message: str) -> Optional[str]:
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """Endpoint principal de chat."""
+    requested_model = _normalize_requested_model(request.model)
+    requested_think_mode = _normalize_requested_think_mode(request.think_mode)
+    effective_model = requested_model or llm_engine.model
+    effective_think_mode = llm_engine.get_effective_think_mode(
+        model_name=effective_model,
+        think_mode=requested_think_mode,
+    )
+
     resolved_user_id = resolve_user_identity(
         user_id=request.user_id,
         source=request.source,
     )
+    latest_web_sources_by_user[resolved_user_id] = []
     history_preview = conversation_history.get(resolved_user_id, [])
     recent_texts = _recent_history_texts(history_preview)
 
@@ -2579,14 +2842,117 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 return ChatResponse(
                     response=f"Encontré esta película: **{movie['title']}** ({movie['year']})",
                     movie=movie,
+                    model_used=effective_model,
+                    think_mode_used=effective_think_mode,
+                    sources=[],
                 )
 
     response_text = await process_chat_message(
         message=request.message,
         user_id=resolved_user_id,
         source=request.source,
+        model=requested_model,
+        think_mode=requested_think_mode,
     )
-    return ChatResponse(response=response_text)
+    return ChatResponse(
+        response=response_text,
+        model_used=effective_model,
+        think_mode_used=effective_think_mode,
+        sources=latest_web_sources_by_user.get(resolved_user_id, []),
+    )
+
+
+@app.get("/llm/catalog", response_model=LLMCatalogResponse)
+async def llm_catalog() -> LLMCatalogResponse:
+    """Expone modelos disponibles y modos de pensamiento para el frontend."""
+    current_model = llm_engine.model
+    current_think_mode = llm_engine.get_effective_think_mode(model_name=current_model)
+
+    models_raw = await llm_engine.list_models()
+    model_options: list[LLMModelOption] = []
+    seen_names: set[str] = set()
+
+    for entry in models_raw:
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        think_mode_type = str(entry.get("think_mode_type") or "none").strip().lower()
+        supports_thinking = bool(entry.get("supports_thinking"))
+        supports_think_levels = bool(entry.get("supports_think_levels"))
+        if think_mode_type not in {"levels", "toggle", "none"}:
+            think_mode_type = "levels" if supports_think_levels else ("toggle" if supports_thinking else "none")
+        model_options.append(
+            LLMModelOption(
+                name=name,
+                display_name=_friendly_model_display_name(name),
+                supports_thinking=supports_thinking,
+                supports_think_levels=supports_think_levels,
+                think_mode_type=think_mode_type,
+                is_selected=name == current_model,
+            )
+        )
+
+    if (
+        current_model.strip()
+        and current_model.lower() not in seen_names
+        and llm_engine.is_chat_model(current_model)
+    ):
+        fallback_think_type = llm_engine.infer_think_mode_type(current_model)
+        model_options.append(
+            LLMModelOption(
+                name=current_model,
+                display_name=_friendly_model_display_name(current_model),
+                supports_thinking=fallback_think_type != "none",
+                supports_think_levels=fallback_think_type == "levels",
+                think_mode_type=fallback_think_type,
+                is_selected=True,
+            )
+        )
+
+    model_options.sort(key=lambda item: item.name.lower())
+
+    gpt_oss_modes = [
+        LLMThinkModeOption(
+            id="low",
+            label="Bajo",
+            description="Respuesta mas rapida con menor profundidad de razonamiento.",
+        ),
+        LLMThinkModeOption(
+            id="medium",
+            label="Medio",
+            description="Balance entre velocidad y calidad de razonamiento.",
+        ),
+        LLMThinkModeOption(
+            id="high",
+            label="Alto",
+            description="Mayor profundidad de razonamiento, tarda mas.",
+        ),
+    ]
+
+    standard_modes = [
+        LLMThinkModeOption(
+            id="off",
+            label="Desactivado",
+            description="Sin razonamiento extendido (si el modelo lo soporta).",
+        ),
+        LLMThinkModeOption(
+            id="on",
+            label="Activado",
+            description="Razonamiento extendido activado.",
+        ),
+    ]
+
+    return LLMCatalogResponse(
+        current_model=current_model,
+        current_think_mode=current_think_mode,
+        models=model_options,
+        gpt_oss_think_modes=gpt_oss_modes,
+        standard_think_modes=standard_modes,
+    )
 
 
 # --- Endpoints de películas (Fase 6.5 web) ---
