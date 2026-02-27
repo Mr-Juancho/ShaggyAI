@@ -69,8 +69,13 @@ _MEDIA_CONTEXT_HINT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MEDIA_STACK_EXPLICIT_HINT_RE = re.compile(
-    r"\b(protocolo|stack|servicios?|radarr|prowlarr|transmission|jellyfin|"
+    r"\b(radarr|prowlarr|transmission|jellyfin|"
+    r"pel[ií]culas|cine|media|multimedia|"
     r"modo\s+pel[ií]culas?|stack\s+de\s+pel[ií]culas?)\b",
+    flags=re.IGNORECASE,
+)
+_MEDIA_STACK_GENERIC_HINT_RE = re.compile(
+    r"\b(protocolo|stack|servicios?|modo)\b",
     flags=re.IGNORECASE,
 )
 _MEDIA_SEMANTIC_ACTION_HINT_RE = re.compile(
@@ -193,13 +198,17 @@ def looks_like_media_stack_semantic_candidate(
     if not text:
         return False
 
-    has_media_words = bool(_MEDIA_STACK_EXPLICIT_HINT_RE.search(text))
-    if has_media_words:
+    has_explicit_media_words = bool(_MEDIA_STACK_EXPLICIT_HINT_RE.search(text))
+    if has_explicit_media_words:
         return True
 
+    has_generic_stack_words = bool(_MEDIA_STACK_GENERIC_HINT_RE.search(text))
     has_recent_context = _has_recent_media_stack_context(recent_messages)
     if not has_recent_context:
         return False
+
+    if has_generic_stack_words and bool(_MEDIA_SEMANTIC_ACTION_HINT_RE.search(text)):
+        return True
 
     if _SHORT_IMPERATIVE_RE.match(text):
         return True

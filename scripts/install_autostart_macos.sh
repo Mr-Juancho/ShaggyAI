@@ -25,11 +25,14 @@ mkdir -p "$LAUNCH_AGENT_DIR" "$LOG_DIR" "$RUNTIME_BASE"
 if [ ! -d "$RUNTIME_DIR" ]; then
   mkdir -p "$RUNTIME_DIR"
 fi
+# Importante: NO sincronizar data/ para preservar memoria y recordatorios
+# del runtime (evita que reaparezcan datos viejos tras reinstalar/autostart).
 rsync -a --delete \
+  --filter='P data/***' \
   --exclude '__pycache__' \
   --exclude '.pycache_local' \
   --exclude 'Desktop' \
-  --exclude 'data/logs/*' \
+  --exclude 'data/***' \
   "$SOURCE_PROJECT_DIR/" "$RUNTIME_DIR/"
 
 chmod +x "$RUN_SCRIPT"

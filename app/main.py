@@ -18,7 +18,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.capability_registry import CapabilityRegistry
-from app.config import FRONTEND_DIR, HOST, MAX_CONTEXT_MESSAGES, PORT, RELOAD, logger
+from app.config import (
+    FRONTEND_DIR,
+    HOST,
+    MAX_CONTEXT_MESSAGES,
+    PORT,
+    RELOAD,
+    TELEGRAM_USER_ID,
+    logger,
+)
 from app.llm_engine import OllamaEngine
 from app.media_stack import (
     build_media_stack_status_response,
@@ -32,7 +40,20 @@ from app.media_stack import (
     start_media_stack_headless,
     stop_media_stack_headless,
 )
-from app.memory_semantic import extract_memory_write_plan
+from app.memory_protocol import (
+    MEMORY_PURGE_ACTIVATION_PHRASE,
+    MEMORY_PURGE_CANCEL_WORD,
+    MEMORY_PURGE_CONFIRMATION_WORD,
+    is_memory_purge_activation_command,
+    is_memory_purge_cancel_word,
+    is_memory_purge_confirmation_word,
+    is_protocols_overview_query,
+)
+from app.memory_semantic import (
+    extract_memory_facts_fallback,
+    extract_memory_mutation_plan,
+    extract_memory_write_plan,
+)
 from app.product_scope import ProductScope
 from app.response_verifier import verify_response
 from app.semantic_router import RouteDecision, SemanticRouter
@@ -135,6 +156,12 @@ class HealthResponse(BaseModel):
 # --- Estado global ---
 conversation_history: dict[str, list[dict[str, str]]] = {}
 pending_reminder_by_user: dict[str, dict[str, str]] = {}
+pending_memory_purge_by_user: dict[str, dict[str, str]] = {}
+CANONICAL_USER_ID = "primary_user"
+USER_ID_ALIASES: set[str] = {"desktop_user"}
+if str(TELEGRAM_USER_ID or "").strip():
+    USER_ID_ALIASES.add(str(TELEGRAM_USER_ID).strip())
+UNIFIED_IDENTITY_SOURCES = {"desktop", "telegram"}
 llm_engine = OllamaEngine()
 product_scope = ProductScope()
 capability_registry = CapabilityRegistry(product_scope=product_scope)
@@ -206,6 +233,7 @@ REMINDER_PENDING_CANCEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 REMINDER_PENDING_TTL_MINUTES = 15
+MEMORY_PURGE_PENDING_TTL_MINUTES = 10
 # Detecta preguntas/quejas sobre recordatorios para NO confundirlas con crear uno.
 REMINDER_QUESTION_RE = re.compile(
     r"\b(por\s*qu[eé]|porque|como\s+es\s+que|no\s+(?:activaste|funciono|funcionó|llego|llegó|sono|sonó|me\s+avisaste|se\s+activo|se\s+activó))\b"
@@ -560,6 +588,73 @@ def _get_pending_reminder(user_id: str) -> Optional[dict[str, str]]:
     return pending
 
 
+def _get_pending_memory_purge(user_id: str) -> Optional[dict[str, str]]:
+    """Retorna solicitud pendiente de purga de memoria si no expiro."""
+    pending = pending_memory_purge_by_user.get(user_id)
+    if not pending:
+        return None
+
+    created_at = pending.get("created_at", "")
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+    except Exception:
+        pending_memory_purge_by_user.pop(user_id, None)
+        return None
+
+    if datetime.now() - created_dt > timedelta(minutes=MEMORY_PURGE_PENDING_TTL_MINUTES):
+        pending_memory_purge_by_user.pop(user_id, None)
+        return None
+    return pending
+
+
+def _set_pending_memory_purge(user_id: str, reason: str = "semantic_request") -> None:
+    """Guarda estado pendiente para confirmar borrado total de memoria."""
+    pending_memory_purge_by_user[user_id] = {
+        "reason": reason,
+        "created_at": datetime.now().isoformat(),
+    }
+
+
+def _clear_pending_memory_purge(user_id: str) -> None:
+    """Elimina estado pendiente de purga para el usuario."""
+    pending_memory_purge_by_user.pop(user_id, None)
+
+
+def _is_memory_purge_confirmation(message: str) -> bool:
+    """Detecta confirmación explícita para ejecutar borrado total."""
+    return is_memory_purge_confirmation_word(message)
+
+
+def _is_memory_purge_cancellation(message: str) -> bool:
+    """Detecta cancelación explícita de borrado total."""
+    return is_memory_purge_cancel_word(message)
+
+
+def _build_protocols_overview_response() -> str:
+    """Respuesta determinista de protocolos funcionales de RUFÜS."""
+    return (
+        "Protocolos disponibles en RUFÜS:\n"
+        "- Protocolo peliculas:\n"
+        "  - iniciar: 'inicia protocolo peliculas'\n"
+        "  - estado: 'estado del protocolo peliculas'\n"
+        "  - apagar: 'apaga protocolo peliculas'\n"
+        "- Protocolo de borrado total de memoria:\n"
+        f"  - activar (frase exacta): '{MEMORY_PURGE_ACTIVATION_PHRASE}'\n"
+        f"  - confirmar (palabra exacta): '{MEMORY_PURGE_CONFIRMATION_WORD}'\n"
+        f"  - cancelar: '{MEMORY_PURGE_CANCEL_WORD}'"
+    )
+
+
+def _handle_protocols_overview_query(message: str) -> Optional[str]:
+    """Detecta preguntas sobre protocolos y responde catálogo interno fijo."""
+    text = (message or "").strip()
+    if not text:
+        return None
+    if is_protocols_overview_query(text):
+        return _build_protocols_overview_response()
+    return None
+
+
 def _looks_like_reminder_creation_request(message: str) -> bool:
     """Detecta peticiones de creacion de recordatorio, incluso sin verbo explicito."""
     if REMINDER_REQUEST_RE.search(message):
@@ -812,11 +907,36 @@ def _normalize_response_format(text: str) -> str:
     return rewritten
 
 
+def resolve_user_identity(user_id: str, source: str = "api") -> str:
+    """Unifica identidad de usuario entre web y Telegram."""
+    raw_user_id = str(user_id or "").strip()
+    source_key = str(source or "").strip().lower()
+    if source_key in UNIFIED_IDENTITY_SOURCES:
+        return CANONICAL_USER_ID
+    if raw_user_id in USER_ID_ALIASES:
+        return CANONICAL_USER_ID
+    return raw_user_id or "default"
+
+
 def clear_user_history(user_id: str) -> bool:
     """Limpia el historial de un usuario en memoria de sesion."""
-    had_history = bool(conversation_history.get(user_id))
-    conversation_history[user_id] = []
+    user_id = resolve_user_identity(user_id=user_id, source="telegram")
+    history = conversation_history.get(user_id)
+    had_history = bool(history)
+    if history is None:
+        conversation_history[user_id] = []
+    else:
+        history.clear()
     return had_history
+
+
+def clear_all_histories() -> int:
+    """Limpia todo el historial de chat en memoria de sesión."""
+    sessions = len(conversation_history)
+    for history in conversation_history.values():
+        history.clear()
+    conversation_history.clear()
+    return sessions
 
 
 async def _build_web_context(
@@ -1130,15 +1250,22 @@ async def _handle_semantic_memory_store(
         message=message,
         history=history,
     )
-    if not plan or not plan.should_store:
-        if plan and plan.clarification_question:
+    facts_to_store: list[str] = []
+    if plan and plan.should_store and plan.facts:
+        facts_to_store = plan.facts
+    else:
+        fallback_facts = extract_memory_facts_fallback(message)
+        if fallback_facts:
+            facts_to_store = fallback_facts
+        elif plan and plan.clarification_question:
             return plan.clarification_question
-        return "Puedo guardarlo, pero necesito que me lo indiques en una frase mas concreta."
+        else:
+            return "Puedo guardarlo, pero necesito que me lo indiques en una frase mas concreta."
 
     stored_count = 0
     skipped_duplicates = 0
     stored_facts: list[str] = []
-    for fact in plan.facts:
+    for fact in facts_to_store:
         stored = await memory_manager.store_user_info(
             info=fact,
             metadata={"source": "semantic_memory_store", "user_id": user_id},
@@ -1172,6 +1299,146 @@ async def _handle_semantic_memory_recall(message: str) -> str:
     if not context:
         return "Todavia no tengo recuerdos guardados sobre eso."
     return "Esto es lo que recuerdo ahora:\n" + context
+
+
+async def _handle_semantic_memory_update(
+    message: str,
+    history: list[dict[str, str]],
+    user_id: str,
+) -> str:
+    """Edita recuerdos existentes a partir de intención semántica."""
+    if not memory_manager:
+        return (
+            "Ahora mismo no tengo disponible el modulo de memoria de largo plazo. "
+            "Revisa dependencias (chromadb) y reinicia el servicio."
+        )
+
+    plan = await extract_memory_mutation_plan(
+        llm_engine=llm_engine,
+        message=message,
+        history=history,
+    )
+    if not plan or plan.operation != "update" or not plan.should_apply:
+        if plan and plan.clarification_question:
+            return plan.clarification_question
+        return "Para editar memoria, dime que dato quieres reemplazar y por cual valor nuevo."
+
+    result = await memory_manager.update_user_fact(
+        target_query=plan.target_query,
+        replacement_facts=plan.replacement_facts,
+        user_id=user_id,
+    )
+    if not result.get("updated"):
+        if result.get("reason") == "not_found":
+            return "No encontre ese recuerdo para editarlo. Si quieres, puedo mostrarte lo que recuerdo ahora."
+        return "No pude actualizar ese recuerdo. Intentalo con una descripcion mas concreta."
+
+    replaced = str(result.get("replaced_document", "")).strip()
+    updated_items = [fact for fact in plan.replacement_facts[:4] if fact.strip()]
+
+    lines = ["Listo, memoria actualizada."]
+    if replaced:
+        lines.append(f"- Antes: {replaced}")
+    for item in updated_items:
+        lines.append(f"- Ahora: {item}")
+    return "\n".join(lines)
+
+
+async def _handle_semantic_memory_delete(
+    message: str,
+    history: list[dict[str, str]],
+    user_id: str,
+) -> str:
+    """Borra recuerdos específicos a partir de intención semántica."""
+    if not memory_manager:
+        return (
+            "Ahora mismo no tengo disponible el modulo de memoria de largo plazo. "
+            "Revisa dependencias (chromadb) y reinicia el servicio."
+        )
+
+    plan = await extract_memory_mutation_plan(
+        llm_engine=llm_engine,
+        message=message,
+        history=history,
+    )
+    if not plan or plan.operation != "delete" or not plan.should_apply:
+        if plan and plan.clarification_question:
+            return plan.clarification_question
+        return "Para borrar memoria puntual, dime que dato quieres que olvide."
+
+    result = await memory_manager.delete_user_facts_by_query(
+        query=plan.target_query,
+        user_id=user_id,
+        max_items=3,
+    )
+    deleted_count = int(result.get("deleted_count", 0) or 0)
+    if deleted_count == 0:
+        return "No encontre recuerdos que coincidan con eso."
+
+    deleted_documents = [str(doc).strip() for doc in (result.get("deleted_documents") or []) if str(doc).strip()]
+    lines = [f"Listo, elimine {deleted_count} recuerdo(s) de memoria de largo plazo."]
+    for doc in deleted_documents[:3]:
+        lines.append(f"- {doc}")
+    return "\n".join(lines)
+
+
+async def _execute_memory_purge_protocol(user_id: str) -> str:
+    """Ejecuta borrado total de memoria persistente + historial de conversación."""
+    if not memory_manager:
+        return (
+            "Ahora mismo no tengo disponible el modulo de memoria de largo plazo. "
+            "Revisa dependencias (chromadb) y reinicia el servicio."
+        )
+
+    purge_result = await memory_manager.purge_all_memory()
+    profile_deleted = int(purge_result.get("profile_deleted", 0))
+    conv_deleted = int(purge_result.get("conversations_deleted", 0))
+    cleared_sessions = clear_all_histories()
+    pending_reminder_by_user.clear()
+    pending_memory_purge_by_user.clear()
+
+    lines = ["Protocolo de borrado de memoria completado."]
+    lines.append(
+        "- Memoria larga eliminada: "
+        f"{profile_deleted + conv_deleted} registros "
+        f"(perfil: {profile_deleted}, conversaciones: {conv_deleted})."
+    )
+    if cleared_sessions:
+        lines.append(
+            "- Historial reciente del chat limpiado en "
+            f"{cleared_sessions} sesion(es)."
+        )
+    else:
+        lines.append("- No habia historial reciente por limpiar.")
+    return "\n".join(lines)
+
+
+async def _handle_semantic_memory_purge(
+    message: str,
+    history: list[dict[str, str]],
+    user_id: str,
+) -> str:
+    """Gestiona solicitud de borrado total con confirmación de seguridad."""
+    _ = history  # reservado para futuras reglas de auditoría
+
+    if not memory_manager:
+        return (
+            "Ahora mismo no tengo disponible el modulo de memoria de largo plazo. "
+            "Revisa dependencias (chromadb) y reinicia el servicio."
+        )
+
+    if not is_memory_purge_activation_command(message):
+        return (
+            "El borrado total solo se activa con esta frase exacta:\n"
+            f"'{MEMORY_PURGE_ACTIVATION_PHRASE}'"
+        )
+
+    _set_pending_memory_purge(user_id, reason="strict_memory_purge")
+    return (
+        "Vas a borrar toda la memoria de largo plazo y el historial reciente.\n"
+        f"Para confirmar, escribe solo: '{MEMORY_PURGE_CONFIRMATION_WORD}'.\n"
+        f"Para cancelar, escribe: '{MEMORY_PURGE_CANCEL_WORD}'."
+    )
 
 
 def _recent_history_texts(history: Optional[list[dict[str, str]]], max_items: int = 8) -> list[str]:
@@ -1215,6 +1482,13 @@ async def _handle_media_stack_action(
     - iniciar stack multimedia bajo demanda (headless)
     - consultar estado actual
     """
+    lowered_message = (message or "").strip().lower()
+    # Guardrail: evitar que comandos del protocolo de memoria entren por multimedia.
+    if is_memory_purge_activation_command(message) or (
+        "borrado" in lowered_message and "memoria" in lowered_message
+    ):
+        return None
+
     recent_texts = _recent_history_texts(history)
 
     status_requested = looks_like_media_stack_status_request(message)
@@ -1330,6 +1604,7 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
     """
     Flujo principal de chat compartido por API y Telegram.
     """
+    user_id = resolve_user_identity(user_id=user_id, source=source)
     logger.info(f"[{source}] Mensaje de {user_id}: {message[:120]}...")
 
     history = conversation_history.setdefault(user_id, [])
@@ -1346,177 +1621,239 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
     )
     web_results: list[dict[str, str]] = []
     datetime_payload: dict[str, str] = {}
+    skip_memory_autostore = False
 
-    deterministic_media_response = await _handle_media_stack_action(
-        message,
-        history=history,
-        llm=llm_engine,
-    )
-    if deterministic_media_response is not None:
-        response_text = deterministic_media_response
-    else:
-        deterministic_reminder_response = await _handle_reminder_action(message, user_id)
-        if deterministic_reminder_response is not None:
-            response_text = deterministic_reminder_response
+    pending_memory_purge = _get_pending_memory_purge(user_id)
+    if pending_memory_purge:
+        if _is_memory_purge_cancellation(message):
+            _clear_pending_memory_purge(user_id)
+            response_text = "Listo, cancele el protocolo de borrado de memoria."
+            skip_memory_autostore = True
+        elif _is_memory_purge_confirmation(message):
+            response_text = await _execute_memory_purge_protocol(user_id=user_id)
+            skip_memory_autostore = True
         else:
-            route_decision = await semantic_router.route(message=message, history=history)
-
-            route_media_action = _media_action_from_route(route_decision)
-            route_media_response = None
-            if route_media_action:
-                route_media_response = await _handle_media_stack_action(
-                    message=message,
-                    history=history,
-                    llm=llm_engine,
-                    forced_action=route_media_action,
-                )
-
-            if route_media_response is not None:
-                response_text = route_media_response
-            elif (
-                route_decision.intent == "memory_store"
-                and capability_registry.get("memory_store_user_fact")
-            ):
-                response_text = await _handle_semantic_memory_store(
-                    message=message,
-                    history=history,
-                    user_id=user_id,
-                )
-            elif (
-                route_decision.intent == "memory_recall"
-                and capability_registry.get("memory_recall_profile")
-            ):
-                response_text = await _handle_semantic_memory_recall(message=message)
+            response_text = (
+                "Hay un borrado total pendiente.\n"
+                f"Escribe solo '{MEMORY_PURGE_CONFIRMATION_WORD}' para confirmar, "
+                f"o '{MEMORY_PURGE_CANCEL_WORD}' para cancelar."
+            )
+            skip_memory_autostore = True
+    elif is_memory_purge_activation_command(message):
+        response_text = await _handle_semantic_memory_purge(
+            message=message,
+            history=history,
+            user_id=user_id,
+        )
+        skip_memory_autostore = True
+    else:
+        protocols_overview = _handle_protocols_overview_query(message)
+        if protocols_overview is not None:
+            response_text = protocols_overview
+            skip_memory_autostore = True
+        else:
+            deterministic_media_response = await _handle_media_stack_action(
+                message,
+                history=history,
+                llm=llm_engine,
+            )
+            if deterministic_media_response is not None:
+                response_text = deterministic_media_response
             else:
-                explicit_web_request = _is_explicit_web_request(message)
-                route_requires_web = route_decision.intent == "web_search" or any(
-                    tool in {"web_search_general", "web_search_news"}
-                    for tool in route_decision.candidate_tools
-                )
-                allow_web_search = explicit_web_request or route_requires_web
+                deterministic_reminder_response = await _handle_reminder_action(message, user_id)
+                if deterministic_reminder_response is not None:
+                    response_text = deterministic_reminder_response
+                else:
+                    route_decision = await semantic_router.route(message=message, history=history)
 
-                memory_context = ""
-                if memory_manager:
-                    memory_context = await memory_manager.search_relevant_context(query=message, n=5)
-                    memory_context = _sanitize_memory_context(memory_context)
-
-                temporal_context = ""
-                should_inject_datetime = (
-                    has_temporal_reference(message)
-                    or bool(route_decision.entities.get("temporal_reference"))
-                    or "get_current_datetime" in route_decision.candidate_tools
-                )
-                if should_inject_datetime and capability_registry.get("get_current_datetime"):
-                    datetime_payload = as_capability_output()
-                    temporal_context = build_datetime_context()
-
-                route_query = str(route_decision.entities.get("query", "")).strip()
-                prefer_news = bool(route_decision.entities.get("prefer_news"))
-                web_query, web_results, web_context = await _build_web_context(
-                    message,
-                    history=history,
-                    allow_web_search=allow_web_search,
-                    query_override=route_query,
-                    prefer_news=prefer_news,
-                )
-                combined_context = "\n\n".join(
-                    part
-                    for part in (
-                        memory_context.strip(),
-                        temporal_context.strip(),
-                        web_context.strip(),
-                    )
-                    if part
-                )
-
-                active_reminders = ""
-                if reminder_manager:
-                    active_reminders = reminder_manager.get_active_reminders_text()
-
-                system_prompt = build_system_prompt(
-                    memory_context=combined_context or None,
-                    active_reminders=active_reminders or None,
-                )
-                channel_addendum = _channel_prompt_addendum(source)
-                if channel_addendum:
-                    system_prompt = f"{system_prompt}\n\n{channel_addendum}"
-
-                model_history = _sanitize_history_for_generation(history)
-                response_text = await llm_engine.generate_response(
-                    messages=model_history,
-                    system_prompt=system_prompt,
-                )
-
-                # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
-                if web_results and (
-                    not response_text.strip()
-                    or response_text.startswith("Error:")
-                    or response_text.strip().upper() == "NADA"
-                    or len(response_text.strip()) <= 8
-                    or "no pude generar una respuesta" in response_text.lower()
-                ):
-                    response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
-
-                # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
-                # intentamos una busqueda directa con el mensaje completo.
-                if (
-                    web_search_engine
-                    and route_requires_web
-                    and not web_results
-                    and (
-                        not response_text.strip()
-                        or response_text.startswith("Error:")
-                        or "no pude generar una respuesta" in response_text.lower()
-                        or response_text.strip().upper() == "NADA"
-                        or len(response_text.strip()) <= 8
-                    )
-                ):
-                    rescue_query = _normalize_web_query(message)
-                    if rescue_query:
-                        rescue_results = await web_search_engine.search(rescue_query, max_results=5)
-                        if rescue_results:
-                            response_text = _format_web_results_for_user(
-                                rescue_query,
-                                rescue_results,
-                                max_results=5,
-                            )
-
-                if route_requires_web and not web_results:
-                    if web_query and not _is_low_signal_web_query(web_query):
-                        response_text = (
-                            f"No encontre resultados verificables para '{web_query}'. "
-                            "Puedo reintentar si me das pais, fuente preferida o rango de fechas."
+                    route_media_action = _media_action_from_route(route_decision)
+                    route_media_response = None
+                    if route_media_action:
+                        route_media_response = await _handle_media_stack_action(
+                            message=message,
+                            history=history,
+                            llm=llm_engine,
+                            forced_action=route_media_action,
                         )
+
+                    if route_media_response is not None:
+                        response_text = route_media_response
+                    elif (
+                        route_decision.intent == "memory_store"
+                        and capability_registry.get("memory_store_user_fact")
+                    ):
+                        response_text = await _handle_semantic_memory_store(
+                            message=message,
+                            history=history,
+                            user_id=user_id,
+                        )
+                        skip_memory_autostore = True
+                    elif (
+                        route_decision.intent == "memory_recall"
+                        and capability_registry.get("memory_recall_profile")
+                    ):
+                        response_text = await _handle_semantic_memory_recall(message=message)
+                        skip_memory_autostore = True
+                    elif (
+                        route_decision.intent == "memory_update"
+                        and capability_registry.get("memory_update_user_fact")
+                    ):
+                        response_text = await _handle_semantic_memory_update(
+                            message=message,
+                            history=history,
+                            user_id=user_id,
+                        )
+                        skip_memory_autostore = True
+                    elif (
+                        route_decision.intent == "memory_delete"
+                        and capability_registry.get("memory_delete_user_fact")
+                    ):
+                        response_text = await _handle_semantic_memory_delete(
+                            message=message,
+                            history=history,
+                            user_id=user_id,
+                        )
+                        skip_memory_autostore = True
+                    elif (
+                        route_decision.intent == "memory_purge"
+                        and capability_registry.get("memory_purge_all")
+                    ):
+                        response_text = await _handle_semantic_memory_purge(
+                            message=message,
+                            history=history,
+                            user_id=user_id,
+                        )
+                        skip_memory_autostore = True
                     else:
-                        response_text = (
-                            route_decision.clarification_question
-                            or "No encontre resultados verificables. "
-                            "Podrias especificar mejor el tema que quieres buscar?"
+                        explicit_web_request = _is_explicit_web_request(message)
+                        route_requires_web = route_decision.intent == "web_search" or any(
+                            tool in {"web_search_general", "web_search_news"}
+                            for tool in route_decision.candidate_tools
+                        )
+                        allow_web_search = explicit_web_request or route_requires_web
+
+                        memory_context = ""
+                        if memory_manager:
+                            memory_context = await memory_manager.search_relevant_context(query=message, n=5)
+                            memory_context = _sanitize_memory_context(memory_context)
+
+                        temporal_context = ""
+                        should_inject_datetime = (
+                            has_temporal_reference(message)
+                            or bool(route_decision.entities.get("temporal_reference"))
+                            or "get_current_datetime" in route_decision.candidate_tools
+                        )
+                        if should_inject_datetime and capability_registry.get("get_current_datetime"):
+                            datetime_payload = as_capability_output()
+                            temporal_context = build_datetime_context()
+
+                        route_query = str(route_decision.entities.get("query", "")).strip()
+                        prefer_news = bool(route_decision.entities.get("prefer_news"))
+                        web_query, web_results, web_context = await _build_web_context(
+                            message,
+                            history=history,
+                            allow_web_search=allow_web_search,
+                            query_override=route_query,
+                            prefer_news=prefer_news,
+                        )
+                        combined_context = "\n\n".join(
+                            part
+                            for part in (
+                                memory_context.strip(),
+                                temporal_context.strip(),
+                                web_context.strip(),
+                            )
+                            if part
                         )
 
-                if source == "telegram" and web_results:
-                    response_text = _append_telegram_sources_block(response_text, web_results)
+                        active_reminders = ""
+                        if reminder_manager:
+                            active_reminders = reminder_manager.get_active_reminders_text()
 
-                # Reintento defensivo: cuando el modelo responde rechazo generico
-                # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
-                if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
-                    logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
-                    retry_prompt = (
-                        f"{system_prompt}\n\n"
-                        "La solicitud actual es benigna y permitida. "
-                        "Responde de forma util y breve; no devuelvas rechazos genericos."
-                    )
-                    retry_response = await llm_engine.generate_response(
-                        messages=_sanitize_history_for_generation(history),
-                        system_prompt=retry_prompt,
-                    )
-                    if retry_response.strip() and not _is_generic_refusal(retry_response):
-                        response_text = retry_response
+                        system_prompt = build_system_prompt(
+                            memory_context=combined_context or None,
+                            active_reminders=active_reminders or None,
+                        )
+                        channel_addendum = _channel_prompt_addendum(source)
+                        if channel_addendum:
+                            system_prompt = f"{system_prompt}\n\n{channel_addendum}"
 
-                auto_reminder_note = await _try_auto_reminder(message)
-                if auto_reminder_note:
-                    response_text = _remove_reminder_denials(response_text)
-                    response_text = f"{response_text}\n\n{auto_reminder_note}"
+                        model_history = _sanitize_history_for_generation(history)
+                        response_text = await llm_engine.generate_response(
+                            messages=model_history,
+                            system_prompt=system_prompt,
+                        )
+
+                        # Fallback cuando el modelo falle y si tenemos resultados web estructurados.
+                        if web_results and (
+                            not response_text.strip()
+                            or response_text.startswith("Error:")
+                            or response_text.strip().upper() == "NADA"
+                            or len(response_text.strip()) <= 8
+                            or "no pude generar una respuesta" in response_text.lower()
+                        ):
+                            response_text = _format_web_results_for_user(web_query, web_results, max_results=5)
+
+                        # Segundo fallback: si el LLM falla y no hubo contexto web inicial,
+                        # intentamos una busqueda directa con el mensaje completo.
+                        if (
+                            web_search_engine
+                            and route_requires_web
+                            and not web_results
+                            and (
+                                not response_text.strip()
+                                or response_text.startswith("Error:")
+                                or "no pude generar una respuesta" in response_text.lower()
+                                or response_text.strip().upper() == "NADA"
+                                or len(response_text.strip()) <= 8
+                            )
+                        ):
+                            rescue_query = _normalize_web_query(message)
+                            if rescue_query:
+                                rescue_results = await web_search_engine.search(rescue_query, max_results=5)
+                                if rescue_results:
+                                    response_text = _format_web_results_for_user(
+                                        rescue_query,
+                                        rescue_results,
+                                        max_results=5,
+                                    )
+
+                        if route_requires_web and not web_results:
+                            if web_query and not _is_low_signal_web_query(web_query):
+                                response_text = (
+                                    f"No encontre resultados verificables para '{web_query}'. "
+                                    "Puedo reintentar si me das pais, fuente preferida o rango de fechas."
+                                )
+                            else:
+                                response_text = (
+                                    route_decision.clarification_question
+                                    or "No encontre resultados verificables. "
+                                    "Podrias especificar mejor el tema que quieres buscar?"
+                                )
+
+                        if source == "telegram" and web_results:
+                            response_text = _append_telegram_sources_block(response_text, web_results)
+
+                        # Reintento defensivo: cuando el modelo responde rechazo generico
+                        # en una consulta claramente benigna (opiniones, entretenimiento, etc.).
+                        if _is_generic_refusal(response_text) and BENIGN_OPINION_HINT_RE.search(message):
+                            logger.warning("Rechazo generico detectado en consulta benigna. Reintentando una vez...")
+                            retry_prompt = (
+                                f"{system_prompt}\n\n"
+                                "La solicitud actual es benigna y permitida. "
+                                "Responde de forma util y breve; no devuelvas rechazos genericos."
+                            )
+                            retry_response = await llm_engine.generate_response(
+                                messages=_sanitize_history_for_generation(history),
+                                system_prompt=retry_prompt,
+                            )
+                            if retry_response.strip() and not _is_generic_refusal(retry_response):
+                                response_text = retry_response
+
+                        auto_reminder_note = await _try_auto_reminder(message)
+                        if auto_reminder_note:
+                            response_text = _remove_reminder_denials(response_text)
+                            response_text = f"{response_text}\n\n{auto_reminder_note}"
 
     response_text = _normalize_response_format(response_text)
     verification = verify_response(
@@ -1533,8 +1870,8 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
     if len(history) > MAX_CONTEXT_MESSAGES:
         del history[:-MAX_CONTEXT_MESSAGES]
 
-    if memory_manager and not _is_generic_refusal(response_text):
-        await memory_manager.extract_and_store_info(history, llm_engine)
+    if memory_manager and not skip_memory_autostore and not _is_generic_refusal(response_text):
+        await memory_manager.extract_and_store_info(history, llm_engine, user_id=user_id)
         summary = truncate_text(
             f"Usuario: {message}\nAsistente: {response_text}",
             max_length=900,
@@ -1544,7 +1881,11 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
             metadata={"source": source, "user_id": user_id},
         )
     elif memory_manager:
-        logger.info("No se guardo resumen en memoria: respuesta de rechazo generico.")
+        logger.info(
+            "No se guardo resumen en memoria: skip=%s generic_refusal=%s",
+            skip_memory_autostore,
+            _is_generic_refusal(response_text),
+        )
 
     logger.info(f"[{source}] Respuesta para {user_id}: {response_text[:120]}...")
     return response_text
@@ -1723,8 +2064,11 @@ async def _extract_movie_title(message: str) -> Optional[str]:
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """Endpoint principal de chat."""
-
-    history_preview = conversation_history.get(request.user_id, [])
+    resolved_user_id = resolve_user_identity(
+        user_id=request.user_id,
+        source=request.source,
+    )
+    history_preview = conversation_history.get(resolved_user_id, [])
     recent_texts = _recent_history_texts(history_preview)
 
     # Detectar intención de película para fuentes web/desktop
@@ -1754,7 +2098,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     response_text = await process_chat_message(
         message=request.message,
-        user_id=request.user_id,
+        user_id=resolved_user_id,
         source=request.source,
     )
     return ChatResponse(response=response_text)
@@ -1854,7 +2198,8 @@ async def remember(request: RememberRequest) -> RememberResponse:
     if len(info) < 3:
         raise HTTPException(status_code=400, detail="La informacion es demasiado corta.")
 
-    metadata = {"source": "manual_api", "user_id": request.user_id}
+    resolved_user_id = resolve_user_identity(user_id=request.user_id, source="api")
+    metadata = {"source": "manual_api", "user_id": resolved_user_id}
     if request.metadata:
         metadata.update(request.metadata)
 

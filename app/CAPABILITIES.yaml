@@ -200,6 +200,64 @@ capabilities:
         response: {type: string}
     fallback_to: [memory_retrieval]
 
+  - id: memory_update_user_fact
+    phase: 2
+    provider: memory_manager
+    summary: Actualiza recuerdos existentes del usuario usando intención semántica.
+    input_schema:
+      type: object
+      required: [target_query, replacement_facts]
+      properties:
+        target_query: {type: string, minLength: 2}
+        replacement_facts:
+          type: array
+          items: {type: string}
+          minItems: 1
+    output_schema:
+      type: object
+      required: [updated, stored_count]
+      properties:
+        updated: {type: boolean}
+        stored_count: {type: integer}
+        replaced_document: {type: string}
+    fallback_to: [memory_recall_profile]
+
+  - id: memory_delete_user_fact
+    phase: 2
+    provider: memory_manager
+    summary: Elimina recuerdos específicos del usuario por búsqueda semántica.
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query: {type: string, minLength: 2}
+        max_items: {type: integer, minimum: 1, maximum: 10}
+    output_schema:
+      type: object
+      required: [deleted_count]
+      properties:
+        deleted_count: {type: integer}
+        deleted_documents:
+          type: array
+          items: {type: string}
+    fallback_to: [memory_recall_profile]
+
+  - id: memory_purge_all
+    phase: 2
+    provider: memory_manager
+    summary: Ejecuta protocolo de borrado total de memoria persistente.
+    input_schema:
+      type: object
+      properties:
+        confirmation: {type: boolean}
+    output_schema:
+      type: object
+      required: [profile_deleted, conversations_deleted]
+      properties:
+        profile_deleted: {type: integer}
+        conversations_deleted: {type: integer}
+    fallback_to: []
+
   - id: memory_store_summary
     phase: 1
     provider: memory_manager

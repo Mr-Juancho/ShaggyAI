@@ -25,6 +25,32 @@ REMINDER_HINT_RE = re.compile(
     r"elimina\s+recordatorio|lista\s+recordatorios|pendientes)\b",
     flags=re.IGNORECASE,
 )
+MEMORY_PURGE_HINT_RE = re.compile(
+    r"\b(protocolo\s+de\s+borrado|borrado\s+de\s+memoria|"
+    r"resetea(?:r)?\s+memoria|reinicia(?:r)?\s+memoria)\b|"
+    r"\b(borra|elimina|limpia|olvida)\b.{0,35}\b(toda|todo)\b.{0,35}\b(memoria|conversaciones?)\b",
+    flags=re.IGNORECASE,
+)
+MEMORY_UPDATE_HINT_RE = re.compile(
+    r"\b(actualiza|corrige|edita|modifica|cambia)\b.{0,45}\b("
+    r"memoria|recuerdo|dato|lo\s+que\s+recuerdas|perfil)\b",
+    flags=re.IGNORECASE,
+)
+MEMORY_DELETE_HINT_RE = re.compile(
+    r"\b(olvida|borra|elimina|quita|remueve)\b.{0,45}\b("
+    r"memoria|recuerdo|dato|lo\s+que\s+recuerdas|perfil)\b",
+    flags=re.IGNORECASE,
+)
+MEMORY_RECALL_HINT_RE = re.compile(
+    r"\b(que\s+recuerdas|que\s+sabes\s+de\s+mi|mi\s+perfil|"
+    r"lo\s+que\s+tienes\s+guardado|recuerdos?\s+sobre)\b",
+    flags=re.IGNORECASE,
+)
+MEMORY_STORE_HINT_RE = re.compile(
+    r"\b(recuerda\s+que|acu[eé]rdate\s+de|guarda(?:r)?\s+en\s+(?:tu\s+)?memoria|"
+    r"ten\s+presente\s+que|anota(?:r)?\s+en\s+tu\s+memoria)\b",
+    flags=re.IGNORECASE,
+)
 
 
 class RouteDecision(BaseModel):
@@ -83,6 +109,46 @@ class SemanticRouter:
                 confidence=0.80,
             )
 
+        if MEMORY_PURGE_HINT_RE.search(message_clean):
+            return RouteDecision(
+                intent="memory_purge",
+                entities={"temporal_reference": temporal},
+                candidate_tools=["memory_purge_all", "chat_general"],
+                confidence=0.76,
+            )
+
+        if MEMORY_UPDATE_HINT_RE.search(message_clean):
+            return RouteDecision(
+                intent="memory_update",
+                entities={"temporal_reference": temporal},
+                candidate_tools=["memory_update_user_fact", "memory_recall_profile"],
+                confidence=0.72,
+            )
+
+        if MEMORY_DELETE_HINT_RE.search(message_clean):
+            return RouteDecision(
+                intent="memory_delete",
+                entities={"temporal_reference": temporal},
+                candidate_tools=["memory_delete_user_fact", "memory_recall_profile"],
+                confidence=0.72,
+            )
+
+        if MEMORY_RECALL_HINT_RE.search(message_clean):
+            return RouteDecision(
+                intent="memory_recall",
+                entities={"temporal_reference": temporal},
+                candidate_tools=["memory_recall_profile", "memory_retrieval"],
+                confidence=0.73,
+            )
+
+        if MEMORY_STORE_HINT_RE.search(message_clean):
+            return RouteDecision(
+                intent="memory_store",
+                entities={"temporal_reference": temporal},
+                candidate_tools=["memory_store_user_fact", "memory_store_summary"],
+                confidence=0.73,
+            )
+
         extracted_query = extract_search_intent(message_clean)
         explicit_web = bool(WEB_HINT_RE.search(message_clean))
         if extracted_query or explicit_web:
@@ -139,7 +205,8 @@ class SemanticRouter:
             f"Mensaje actual: {message}\n"
             f"Historial corto:\n{history_text or '- (sin historial)'}\n"
             "Intenciones permitidas: general_chat, web_search, time_sensitive_answer, "
-            "reminder_management, memory_store, memory_recall.\n"
+            "reminder_management, memory_store, memory_recall, memory_update, "
+            "memory_delete, memory_purge.\n"
             f"Herramientas permitidas: {', '.join(allowed_tools)}\n"
             "Schema requerido:\n"
             "{\n"
@@ -168,6 +235,14 @@ class SemanticRouter:
 
     def _sanitize_decision(self, message: str, decision: RouteDecision) -> RouteDecision:
         """Ensures route decision complies with product scope and registry."""
+        intent_alias = {
+            "memory_edit": "memory_update",
+            "memory_forget": "memory_delete",
+            "memory_wipe": "memory_purge",
+            "memory_reset": "memory_purge",
+        }
+        decision.intent = intent_alias.get(decision.intent, decision.intent)
+
         allowed_tools = set(self.capability_registry.all_ids())
         filtered = [tool_id for tool_id in decision.candidate_tools if tool_id in allowed_tools]
         if not filtered:
@@ -193,6 +268,15 @@ class SemanticRouter:
         elif decision.intent == "memory_recall":
             if "memory_recall_profile" in allowed_tools and "memory_recall_profile" not in filtered:
                 filtered.insert(0, "memory_recall_profile")
+        elif decision.intent == "memory_update":
+            if "memory_update_user_fact" in allowed_tools and "memory_update_user_fact" not in filtered:
+                filtered.insert(0, "memory_update_user_fact")
+        elif decision.intent == "memory_delete":
+            if "memory_delete_user_fact" in allowed_tools and "memory_delete_user_fact" not in filtered:
+                filtered.insert(0, "memory_delete_user_fact")
+        elif decision.intent == "memory_purge":
+            if "memory_purge_all" in allowed_tools and "memory_purge_all" not in filtered:
+                filtered.insert(0, "memory_purge_all")
 
         decision.candidate_tools = self.product_scope.filter_allowed(filtered)
         if not decision.candidate_tools:

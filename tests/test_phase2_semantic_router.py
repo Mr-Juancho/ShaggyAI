@@ -50,6 +50,19 @@ class Phase2SemanticRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("get_current_datetime", decision.candidate_tools)
         self.assertGreaterEqual(decision.confidence, 0.8)
 
+    async def test_router_fallback_detects_memory_delete(self):
+        scope = ProductScope()
+        registry = CapabilityRegistry(product_scope=scope)
+        router = SemanticRouter(FakeLLM(["invalid json"]), registry, scope)
+
+        decision = await router.route(
+            message="Olvida de tu memoria que me gusta el cafe",
+            history=[],
+        )
+
+        self.assertEqual(decision.intent, "memory_delete")
+        self.assertIn("memory_delete_user_fact", decision.candidate_tools)
+
 
 if __name__ == "__main__":
     unittest.main()

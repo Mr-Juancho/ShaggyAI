@@ -33,6 +33,14 @@ class Phase5MediaStackSemanticTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_semantic_candidate_avoids_false_positive_memory_protocol(self):
+        self.assertFalse(
+            looks_like_media_stack_semantic_candidate(
+                "activa el protocolo de borrado total de memoria",
+                recent_messages=[],
+            )
+        )
+
     def test_semantic_candidate_uses_recent_context_for_short_followup(self):
         recent = ["Protocolo peliculas apagado. Estado: Radarr:OFF | Prowlarr:OFF"]
         self.assertTrue(looks_like_media_stack_semantic_candidate("hazlo", recent))
