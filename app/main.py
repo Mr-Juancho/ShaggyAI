@@ -54,6 +54,7 @@ from app.memory_semantic import (
     extract_memory_mutation_plan,
     extract_memory_write_plan,
 )
+from app.reminder_semantic import extract_multi_reminder_plan, extract_reminder_action_plan
 from app.product_scope import ProductScope
 from app.response_verifier import verify_response
 from app.semantic_router import RouteDecision, SemanticRouter
@@ -208,6 +209,22 @@ telegram_bot = None
 telegram_task: Optional[asyncio.Task] = None
 media_stack_start_task: Optional[asyncio.Task] = None
 
+REMINDER_IMPLICIT_VERB_RE = re.compile(
+    r"\b(recu[eé]rdame|recordarme|no\s+olvidar|av[ií]same|avisame)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_CREATION_VERB_RE = re.compile(
+    r"\b(crea|crear|activa|activar|programa|programar|pon|poner|agenda|agendar)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_NOUN_RE = re.compile(
+    r"\b(recordatorio|recordatorios|aviso|avisos)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_NOUN_SINGULAR_RE = re.compile(
+    r"\b(recordatorio|aviso)\b",
+    flags=re.IGNORECASE,
+)
 REMINDER_REQUEST_RE = re.compile(
     r"\b(recu[eé]rdame|recordarme|no\s+olvidar|av[ií]same|avisame)\b|"
     r"\b(crea|crear|activa|activar|programa|programar|pon|poner|agenda|agendar)\b.{0,40}\b(recordatorio|aviso)\b",
@@ -258,6 +275,21 @@ REMINDER_DELETE_ALL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 REMINDER_ID_RE = re.compile(r"\b([a-f0-9]{8})\b", flags=re.IGNORECASE)
+MEMORY_DOMAIN_RE = re.compile(
+    r"\b(memoria|memorias|largo\s+plazo|recuerdo|recuerdos|perfil|conversaciones?)\b",
+    flags=re.IGNORECASE,
+)
+MEMORY_ACTION_RE = re.compile(
+    r"\b(guarda|guardar|recuerda|acu[eé]rdate|olvida|borra|borrar|elimina|eliminar|"
+    r"quita|quitar|remueve|remover|edita|editar|actualiza|actualizar|modifica|modificar|"
+    r"corrige|corregir|muestra|mostrar|dime)\b",
+    flags=re.IGNORECASE,
+)
+MEMORY_QUOTED_TARGET_RE = re.compile(r"[\"'“”‘’]([^\"“”‘’']{2,220})[\"'“”‘’]")
+MULTI_REMINDER_HINT_RE = re.compile(
+    r"\b(y\s+otro|y\s+otra|adem[aá]s|tambi[eé]n|dos|2)\b|\n\s*\d+[.)]\s*",
+    flags=re.IGNORECASE,
+)
 REMINDER_DENIAL_RE = re.compile(
     r"(no\s+puedo\s+(?:crear|activar|poner).{0,40}recordatorio|"
     r"no\s+tengo\s+acceso.{0,40}recordatorio|"
@@ -657,18 +689,200 @@ def _handle_protocols_overview_query(message: str) -> Optional[str]:
 
 def _looks_like_reminder_creation_request(message: str) -> bool:
     """Detecta peticiones de creacion de recordatorio, incluso sin verbo explicito."""
-    if REMINDER_REQUEST_RE.search(message):
-        return True
-
+    if _looks_like_memory_management_request(message):
+        return False
     if REMINDER_QUESTION_RE.search(message) or REMINDER_LIST_RE.search(message):
         return False
     if REMINDER_DELETE_RE.search(message):
         return False
 
-    lower = message.lower()
-    if re.search(r"\b(recordatorio|aviso)\b", lower) and REMINDER_DATETIME_HINT_RE.search(message):
+    has_datetime_hint = bool(REMINDER_DATETIME_HINT_RE.search(message))
+    has_noun = bool(REMINDER_NOUN_RE.search(message))
+    has_noun_singular = bool(REMINDER_NOUN_SINGULAR_RE.search(message))
+    has_implicit_verb = bool(REMINDER_IMPLICIT_VERB_RE.search(message))
+    has_creation_verb = bool(REMINDER_CREATION_VERB_RE.search(message))
+
+    # Modo explicito de recordatorio: si el usuario habla de "recordatorio/aviso",
+    # lo tratamos como intento de creación solo cuando hay señal de acción.
+    if has_noun and has_creation_verb:
+        return True
+
+    # Permitir casos abreviados de tipo "recordatorio mañana a las 8",
+    # pero solo en singular para evitar falsos positivos como
+    # "mejorar los recordatorios".
+    if has_noun_singular and has_datetime_hint:
+        return True
+
+    # Modo implicito ("recuérdame ..."): solo crear recordatorio si incluye
+    # señal temporal; sin fecha/hora es ambiguo y debe pasar al router semántico.
+    if has_implicit_verb and has_datetime_hint:
+        return True
+
+    return False
+
+
+def _looks_like_memory_management_request(message: str) -> bool:
+    """Detecta si el mensaje apunta al dominio de memoria (no recordatorios)."""
+    text = str(message or "").strip()
+    if not text:
+        return False
+    if not MEMORY_DOMAIN_RE.search(text):
+        return False
+    if MEMORY_ACTION_RE.search(text):
+        return True
+    if re.search(r"\b(que\s+recuerdas|que\s+sabes\s+de\s+mi|mi\s+perfil)\b", text, flags=re.IGNORECASE):
         return True
     return False
+
+
+def _looks_like_multi_reminder_request(message: str) -> bool:
+    """Heurística rápida para detectar creación múltiple en una sola frase."""
+    text = str(message or "")
+    if not text.strip():
+        return False
+    lowered = text.lower()
+    datetime_hits = REMINDER_DATETIME_HINT_RE.findall(text)
+    if len(datetime_hits) >= 2 and re.search(r"\by\b", lowered):
+        return True
+    if re.search(r"\by\s+para\b", lowered) and len(re.findall(r"\bpara\b", lowered)) >= 2:
+        return True
+    if not MULTI_REMINDER_HINT_RE.search(text):
+        return False
+    datetime_hits = REMINDER_DATETIME_HINT_RE.findall(text)
+    if len(datetime_hits) >= 2:
+        return True
+    # Si dice "y otro/además" lo tratamos como intento múltiple aunque solo
+    # haya una fecha explícita; el extractor semántico pedirá aclaración si falta.
+    return True
+
+
+def _extract_explicit_memory_target(message: str) -> str:
+    """Extrae un objetivo de borrado/edición explícito desde el mensaje del usuario."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+
+    quoted = MEMORY_QUOTED_TARGET_RE.findall(text)
+    if quoted:
+        candidates = [item.strip() for item in quoted if item and item.strip()]
+        if candidates:
+            return max(candidates, key=len)
+
+    token_with_digits = re.findall(r"\b[A-Za-zÁÉÍÓÚáéíóúÑñ_]*\d+[A-Za-z0-9ÁÉÍÓÚáéíóúÑñ_]*\b", text)
+    if token_with_digits:
+        return token_with_digits[-1].strip()
+
+    return ""
+
+
+def _format_created_reminders_response(reminders: list[dict[str, Any]], skipped: int = 0) -> str:
+    """Formatea respuesta de creación para 1..N recordatorios."""
+    if not reminder_manager or not reminders:
+        return "No pude crear recordatorios con ese mensaje."
+
+    if len(reminders) == 1:
+        reminder = reminders[0]
+        reminder_date = reminder_manager.format_datetime_for_user(reminder["datetime"])
+        return (
+            "Listo, cree este recordatorio:\n"
+            f"- ID: {reminder['id']}\n"
+            f"- Texto: {reminder['text']}\n"
+            f"- Fecha: {reminder_date}"
+        )
+
+    lines = ["Listo, cree estos recordatorios:"]
+    for reminder in reminders:
+        reminder_date = reminder_manager.format_datetime_for_user(reminder["datetime"])
+        lines.append(f"- [{reminder['id']}] {reminder['text']} ({reminder_date})")
+    if skipped > 0:
+        lines.append(f"- Omiti {skipped} item(s) porque faltaba accion o fecha/hora valida.")
+    return "\n".join(lines)
+
+
+async def _try_create_multiple_reminders(
+    message: str,
+    history: list[dict[str, str]],
+    user_id: str,
+    llm: Any,
+) -> Optional[str]:
+    """Intenta crear múltiples recordatorios a partir de un solo mensaje."""
+    if not reminder_manager or not llm:
+        return None
+
+    deterministic_drafts: list[dict[str, str]] = []
+    if hasattr(reminder_manager, "extract_multiple_reminder_drafts"):
+        try:
+            deterministic_drafts = reminder_manager.extract_multiple_reminder_drafts(message, max_items=8)
+        except Exception:
+            deterministic_drafts = []
+
+    multi_hint = _looks_like_multi_reminder_request(message)
+    multi_plan = None
+    if multi_hint or len(deterministic_drafts) >= 2:
+        multi_plan = await extract_multi_reminder_plan(
+            llm_engine=llm,
+            message=message,
+            history=history,
+        )
+    elif len(deterministic_drafts) < 2:
+        return None
+
+    llm_drafts: list[dict[str, str]] = []
+    if multi_plan:
+        for draft in multi_plan.reminders[:8]:
+            task = str(draft.task_text or "").strip()
+            dt_text = str(draft.datetime_text or "").strip()
+            if task and dt_text:
+                llm_drafts.append({"text": task, "datetime": dt_text})
+
+    selected_drafts: list[dict[str, str]]
+    if len(deterministic_drafts) >= 2:
+        # Priorizamos extracción determinista por estabilidad: evita duplicados
+        # o slots inventados por extracción LLM cuando el mensaje ya parsea bien.
+        selected_drafts = list(deterministic_drafts)
+    else:
+        selected_drafts = list(llm_drafts)
+
+    if len(selected_drafts) < 2:
+        if multi_hint and multi_plan and multi_plan.clarification_question:
+            return multi_plan.clarification_question
+        if multi_hint:
+            return (
+                "Puedo crear varios recordatorios en un solo mensaje, "
+                "pero necesito que cada item tenga accion y fecha/hora."
+            )
+        return None
+
+    created: list[dict[str, Any]] = []
+    skipped = 0
+    for draft in selected_drafts[:8]:
+        task = str(draft.get("text", "")).strip()
+        dt_value = str(draft.get("datetime", "")).strip()
+        if not task or not dt_value:
+            skipped += 1
+            continue
+        try:
+            reminder = reminder_manager.create_reminder(text=task, dt=dt_value)
+        except ValueError:
+            fallback_text = f"recuérdame {task} {dt_value}".strip()
+            try:
+                reminder = await reminder_manager.create_from_natural_language(fallback_text)
+            except ValueError:
+                skipped += 1
+                continue
+            if not reminder:
+                skipped += 1
+                continue
+        created.append(reminder)
+
+    if not created:
+        return (
+            "No pude crear los recordatorios. "
+            "Intentalo indicando para cada uno: accion + fecha/hora."
+        )
+
+    pending_reminder_by_user.pop(user_id, None)
+    return _format_created_reminders_response(created, skipped=skipped)
 
 
 def _looks_like_reminder_task_followup(message: str) -> bool:
@@ -1044,7 +1258,7 @@ async def _try_auto_reminder(message: str) -> Optional[str]:
     if not reminder_manager:
         return None
 
-    if not REMINDER_REQUEST_RE.search(message):
+    if not _looks_like_reminder_creation_request(message):
         return None
 
     if REMINDER_QUESTION_RE.search(message):
@@ -1101,7 +1315,227 @@ def _extract_reminder_delete_query(message: str) -> str:
     return ""
 
 
-async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
+def _resolve_single_reminder_target(
+    target_id: str = "",
+    target_query: str = "",
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Resuelve un recordatorio activo por ID o texto, reportando ambigüedad."""
+    if not reminder_manager:
+        return None, "Sistema de recordatorios no disponible."
+
+    reminder: Optional[dict[str, Any]] = None
+    clean_id = str(target_id or "").strip().lower()
+    clean_query = str(target_query or "").strip()
+
+    if clean_id:
+        reminder = reminder_manager.get_active_reminder_by_id(clean_id)
+        if not reminder:
+            return None, f"No encontre un recordatorio activo con ID {clean_id}."
+        return reminder, None
+
+    if clean_query:
+        matches = reminder_manager.find_active_reminders_by_text(clean_query)
+        if not matches:
+            return None, "No encontre un recordatorio activo que coincida con eso."
+        if len(matches) > 1:
+            options = [
+                f"- [{item['id']}] {item['text']} ({reminder_manager.format_datetime_for_user(item['datetime'])})"
+                for item in matches[:4]
+            ]
+            return None, (
+                "Encontre varios recordatorios que coinciden. "
+                "Dime el ID exacto de cual quieres modificar:\n"
+                + "\n".join(options)
+            )
+        reminder = matches[0]
+        return reminder, None
+
+    active = reminder_manager.get_active_reminders()
+    if not active:
+        return None, "No tienes recordatorios activos ahora."
+    if len(active) == 1:
+        return active[0], None
+
+    options = [
+        f"- [{item['id']}] {item['text']} ({reminder_manager.format_datetime_for_user(item['datetime'])})"
+        for item in active[:4]
+    ]
+    return None, (
+        "Necesito que me digas cual recordatorio es (hay varios activos). "
+        "Puedes responder con el ID exacto:\n"
+        + "\n".join(options)
+    )
+
+
+async def _handle_semantic_reminder_action(
+    message: str,
+    history: list[dict[str, str]],
+    user_id: str,
+    llm: Any,
+) -> Optional[str]:
+    """Gestiona recordatorios por intención semántica (create/list/delete/update/postpone)."""
+    if not reminder_manager or not llm:
+        return None
+
+    plan = await extract_reminder_action_plan(
+        llm_engine=llm,
+        message=message,
+        history=history,
+    )
+    if not plan or plan.operation == "none":
+        return None
+
+    if (
+        not plan.should_apply
+        and plan.operation in {"delete", "update", "postpone"}
+        and not str(plan.target_id or "").strip()
+        and not str(plan.target_query or "").strip()
+    ):
+        singleton_target, _ = _resolve_single_reminder_target()
+        if singleton_target:
+            plan.target_id = str(singleton_target.get("id", "")).strip().lower()
+            plan.should_apply = bool(plan.target_id)
+
+    if not plan.should_apply:
+        if plan.clarification_question:
+            return plan.clarification_question
+        return None
+
+    if plan.operation == "list":
+        return reminder_manager.format_active_reminders_for_chat()
+
+    if plan.operation == "create":
+        multi_response = await _try_create_multiple_reminders(
+            message=message,
+            history=history,
+            user_id=user_id,
+            llm=llm,
+        )
+        if multi_response is not None:
+            return multi_response
+
+        task = str(plan.task_text or "").strip()
+        dt_text = str(plan.datetime_text or "").strip()
+        try:
+            if task and dt_text:
+                reminder = reminder_manager.create_reminder(text=task, dt=dt_text)
+            else:
+                reminder = await reminder_manager.create_from_natural_language(message)
+        except ValueError as exc:
+            reason = str(exc).strip().lower()
+            if reason == "missing_task":
+                return (
+                    "Ya tengo la fecha, pero me falta la accion del recordatorio. "
+                    "Ejemplo: 'para pagar la factura'."
+                )
+            if reason == "missing_datetime":
+                return (
+                    "Puedo crear el recordatorio, pero necesito fecha/hora. "
+                    "Ejemplo: 'en 30 minutos' o 'mañana a las 8'."
+                )
+            return "No pude crear el recordatorio. Intentalo indicando accion y fecha/hora."
+
+        pending_reminder_by_user.pop(user_id, None)
+        return _format_created_reminders_response([reminder])
+
+    if plan.operation == "delete":
+        if plan.delete_all:
+            deleted_count = reminder_manager.delete_all_active()
+            if deleted_count == 0:
+                return "No habia recordatorios activos para eliminar."
+            return f"Listo, elimine {deleted_count} recordatorio(s) activos."
+
+        target, error_message = _resolve_single_reminder_target(
+            target_id=plan.target_id,
+            target_query=plan.target_query,
+        )
+        if not target:
+            return error_message
+        deleted = reminder_manager.delete_reminder(target["id"])
+        if not deleted:
+            return f"No pude eliminar el recordatorio [{target['id']}]."
+        reminder_date = reminder_manager.format_datetime_for_user(target["datetime"])
+        return (
+            "Listo, elimine este recordatorio:\n"
+            f"- [{target['id']}] {target['text']}\n"
+            f"- Fecha: {reminder_date}"
+        )
+
+    if plan.operation == "update":
+        target, error_message = _resolve_single_reminder_target(
+            target_id=plan.target_id,
+            target_query=plan.target_query,
+        )
+        if not target:
+            return error_message
+
+        new_text = str(plan.task_text or "").strip() or None
+        new_dt = str(plan.datetime_text or "").strip() or None
+        try:
+            updated = reminder_manager.update_reminder(
+                reminder_id=target["id"],
+                new_text=new_text,
+                new_datetime_text=new_dt,
+            )
+        except ValueError as exc:
+            reason = str(exc).strip().lower()
+            if reason == "missing_task":
+                return "No pude actualizar: el nuevo texto del recordatorio quedo vacio."
+            if reason == "missing_datetime":
+                return "No pude actualizar: no entendi la nueva fecha/hora."
+            if reason == "no_changes":
+                return "No detecte cambios para aplicar en ese recordatorio."
+            return "No pude actualizar ese recordatorio. Intentalo con mas detalle."
+
+        reminder_date = reminder_manager.format_datetime_for_user(updated["datetime"])
+        return (
+            "Listo, recordatorio actualizado:\n"
+            f"- ID: {updated['id']}\n"
+            f"- Texto: {updated['text']}\n"
+            f"- Fecha: {reminder_date}"
+        )
+
+    if plan.operation == "postpone":
+        target, error_message = _resolve_single_reminder_target(
+            target_id=plan.target_id,
+            target_query=plan.target_query,
+        )
+        if not target:
+            return error_message
+
+        postpone_text = str(plan.datetime_text or "").strip()
+        try:
+            updated = reminder_manager.postpone_reminder(
+                reminder_id=target["id"],
+                postpone_text=postpone_text,
+            )
+        except ValueError as exc:
+            reason = str(exc).strip().lower()
+            if reason == "missing_datetime":
+                return (
+                    "No pude posponerlo porque falta el nuevo tiempo. "
+                    "Ejemplo: '30 minutos' o 'mañana a las 8'."
+                )
+            return "No pude posponer ese recordatorio. Intentalo indicando cuanto moverlo."
+
+        reminder_date = reminder_manager.format_datetime_for_user(updated["datetime"])
+        return (
+            "Listo, recordatorio pospuesto:\n"
+            f"- ID: {updated['id']}\n"
+            f"- Texto: {updated['text']}\n"
+            f"- Nueva fecha: {reminder_date}"
+        )
+
+    return None
+
+
+async def _handle_reminder_action(
+    message: str,
+    user_id: str,
+    history: Optional[list[dict[str, str]]] = None,
+    llm: Any = None,
+    semantic_mode: bool = False,
+) -> Optional[str]:
     """
     Maneja acciones de recordatorios de forma deterministica en chat libre:
     crear, listar/consultar y eliminar/quitar.
@@ -1111,6 +1545,8 @@ async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
 
     message_clean = message.strip()
     message_lower = message_clean.lower()
+    if _looks_like_memory_management_request(message_clean):
+        return None
 
     if REMINDER_LIST_RE.search(message_clean):
         return reminder_manager.format_active_reminders_for_chat()
@@ -1185,7 +1621,26 @@ async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
     if REMINDER_QUESTION_RE.search(message_clean):
         return None
 
+    if semantic_mode:
+        semantic_response = await _handle_semantic_reminder_action(
+            message=message_clean,
+            history=history or [],
+            user_id=user_id,
+            llm=llm,
+        )
+        if semantic_response is not None:
+            return semantic_response
+
     if is_creation_request:
+        multi_response = await _try_create_multiple_reminders(
+            message=message_clean,
+            history=history or [],
+            user_id=user_id,
+            llm=llm,
+        )
+        if multi_response is not None:
+            return multi_response
+
         try:
             reminder = await reminder_manager.create_from_natural_language(message_clean)
         except ValueError as exc:
@@ -1219,13 +1674,7 @@ async def _handle_reminder_action(message: str, user_id: str) -> Optional[str]:
             )
 
         pending_reminder_by_user.pop(user_id, None)
-        reminder_date = reminder_manager.format_datetime_for_user(reminder["datetime"])
-        return (
-            "Listo, cree este recordatorio:\n"
-            f"- ID: {reminder['id']}\n"
-            f"- Texto: {reminder['text']}\n"
-            f"- Fecha: {reminder_date}"
-        )
+        return _format_created_reminders_response([reminder])
 
     return None
 
@@ -1366,8 +1815,11 @@ async def _handle_semantic_memory_delete(
             return plan.clarification_question
         return "Para borrar memoria puntual, dime que dato quieres que olvide."
 
+    explicit_target = _extract_explicit_memory_target(message)
+    target_query = explicit_target or plan.target_query
+
     result = await memory_manager.delete_user_facts_by_query(
-        query=plan.target_query,
+        query=target_query,
         user_id=user_id,
         max_items=3,
     )
@@ -1660,9 +2112,16 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
             if deterministic_media_response is not None:
                 response_text = deterministic_media_response
             else:
-                deterministic_reminder_response = await _handle_reminder_action(message, user_id)
+                deterministic_reminder_response = await _handle_reminder_action(
+                    message,
+                    user_id,
+                    history=history,
+                    llm=llm_engine,
+                    semantic_mode=False,
+                )
                 if deterministic_reminder_response is not None:
                     response_text = deterministic_reminder_response
+                    skip_memory_autostore = True
                 else:
                     route_decision = await semantic_router.route(message=message, history=history)
 
@@ -1678,6 +2137,32 @@ async def process_chat_message(message: str, user_id: str, source: str = "api") 
 
                     if route_media_response is not None:
                         response_text = route_media_response
+                    elif (
+                        route_decision.intent == "reminder_management"
+                        and (
+                            capability_registry.get("reminder_create")
+                            or capability_registry.get("reminder_list")
+                            or capability_registry.get("reminder_delete")
+                            or capability_registry.get("reminder_update")
+                            or capability_registry.get("reminder_postpone")
+                        )
+                    ):
+                        semantic_reminder_response = await _handle_reminder_action(
+                            message=message,
+                            user_id=user_id,
+                            history=history,
+                            llm=llm_engine,
+                            semantic_mode=True,
+                        )
+                        if semantic_reminder_response is not None:
+                            response_text = semantic_reminder_response
+                            skip_memory_autostore = True
+                        else:
+                            response_text = (
+                                route_decision.clarification_question
+                                or "¿Qué quieres hacer con tus recordatorios: crear, editar, posponer o eliminar?"
+                            )
+                            skip_memory_autostore = True
                     elif (
                         route_decision.intent == "memory_store"
                         and capability_registry.get("memory_store_user_fact")

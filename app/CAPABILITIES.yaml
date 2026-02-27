@@ -147,6 +147,46 @@ capabilities:
         message: {type: string}
     fallback_to: [reminder_list]
 
+  - id: reminder_update
+    phase: 2
+    provider: reminder_manager
+    summary: Edita recordatorios activos (texto y/o fecha) por intención semántica.
+    input_schema:
+      type: object
+      properties:
+        id: {type: string}
+        query: {type: string}
+        text: {type: string}
+        datetime: {type: string}
+    output_schema:
+      type: object
+      required: [updated]
+      properties:
+        updated: {type: boolean}
+        id: {type: string}
+        text: {type: string}
+        datetime: {type: string}
+    fallback_to: [reminder_list]
+
+  - id: reminder_postpone
+    phase: 2
+    provider: reminder_manager
+    summary: Pospone recordatorios activos usando desplazamiento o nueva fecha.
+    input_schema:
+      type: object
+      properties:
+        id: {type: string}
+        query: {type: string}
+        postpone_to: {type: string}
+    output_schema:
+      type: object
+      required: [updated]
+      properties:
+        updated: {type: boolean}
+        id: {type: string}
+        datetime: {type: string}
+    fallback_to: [reminder_list]
+
   - id: memory_retrieval
     phase: 1
     provider: memory_manager

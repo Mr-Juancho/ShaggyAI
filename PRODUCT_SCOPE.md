@@ -11,17 +11,19 @@ Contrato de producto para RUFÜS. Define un alcance estricto y auditable.
 5. `reminder_create`: creación de recordatorios por lenguaje natural.
 6. `reminder_list`: listado de recordatorios activos.
 7. `reminder_delete`: eliminación de recordatorios por ID o texto.
-8. `memory_store_user_fact`: guardado explícito de datos personales en memoria larga.
-9. `memory_retrieval`: recuperación de contexto relevante de memoria.
-10. `memory_recall_profile`: respuesta explícita a "qué recuerdas de mí/sobre X".
-11. `memory_store_summary`: guardado de resumen de conversación útil.
-12. `memory_update_user_fact`: edición semántica de recuerdos existentes del usuario.
-13. `memory_delete_user_fact`: borrado semántico de recuerdos específicos.
-14. `memory_purge_all`: borrado total de memoria larga (perfil + conversaciones).
-15. `media_stack_start`: inicio del stack multimedia en background.
-16. `media_stack_status`: consulta de estado del stack multimedia.
-17. `media_stack_stop`: apagado del stack multimedia.
-18. `movie_search_radarr`: búsqueda de películas en Radarr para flujo web/desktop.
+8. `reminder_update`: edición semántica de recordatorios existentes.
+9. `reminder_postpone`: posponer recordatorios por tiempo relativo o nueva fecha.
+10. `memory_store_user_fact`: guardado explícito de datos personales en memoria larga.
+11. `memory_retrieval`: recuperación de contexto relevante de memoria.
+12. `memory_recall_profile`: respuesta explícita a "qué recuerdas de mí/sobre X".
+13. `memory_store_summary`: guardado de resumen de conversación útil.
+14. `memory_update_user_fact`: edición semántica de recuerdos existentes del usuario.
+15. `memory_delete_user_fact`: borrado semántico de recuerdos específicos.
+16. `memory_purge_all`: borrado total de memoria larga (perfil + conversaciones).
+17. `media_stack_start`: inicio del stack multimedia en background.
+18. `media_stack_status`: consulta de estado del stack multimedia.
+19. `media_stack_stop`: apagado del stack multimedia.
+20. `movie_search_radarr`: búsqueda de películas en Radarr para flujo web/desktop.
 
 ## Reglas de gobernanza
 

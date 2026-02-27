@@ -21,8 +21,26 @@ WEB_HINT_RE = re.compile(
 )
 NEWS_HINT_RE = re.compile(r"\b(noticias?|news|titulares|actualidad)\b", flags=re.IGNORECASE)
 REMINDER_HINT_RE = re.compile(
-    r"\b(recordatorio|recordatorios|recuerdame|recuerdame|avisame|avísame|"
-    r"elimina\s+recordatorio|lista\s+recordatorios|pendientes)\b",
+    r"\b(recordatorio|recordatorios|recuerdame|recu[eé]rdame|avisame|av[ií]same|"
+    r"pendientes|pospon|aplaza|mueve|cambia|edita)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_ACTION_HINT_RE = re.compile(
+    r"\b(crea|crear|activa|activar|programa|programar|pon|poner|agenda|agendar|"
+    r"lista|listar|ver|mostrar|muestrame|mu[eé]strame|consulta|consultar|"
+    r"elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|"
+    r"edita|editar|actualiza|actualizar|modifica|modificar|"
+    r"pospon|posponer|aplaza|aplazar|mueve|mover|recuerdame|recu[eé]rdame|avisame|av[ií]same)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_QUERY_HINT_RE = re.compile(
+    r"\b(cu[aá]les?|que|qu[eé])\b.{0,35}\b(recordatorios?|pendientes)\b",
+    flags=re.IGNORECASE,
+)
+REMINDER_EXPLICIT_HINT_RE = re.compile(
+    r"\b(recordatorio|recordatorios|aviso|avisos|pendientes|"
+    r"pospon|aplaza|mueve|reprograma|cambia|edita|elimina|borra|"
+    r"lista|listar|mostrar|muestrame|mu[eé]strame|cancela)\b",
     flags=re.IGNORECASE,
 )
 MEMORY_PURGE_HINT_RE = re.compile(
@@ -101,14 +119,6 @@ class SemanticRouter:
         message_lower = message_clean.lower()
         temporal = has_temporal_reference(message_clean)
 
-        if REMINDER_HINT_RE.search(message_clean):
-            return RouteDecision(
-                intent="reminder_management",
-                entities={"temporal_reference": temporal},
-                candidate_tools=["reminder_create", "reminder_list", "reminder_delete"],
-                confidence=0.80,
-            )
-
         if MEMORY_PURGE_HINT_RE.search(message_clean):
             return RouteDecision(
                 intent="memory_purge",
@@ -147,6 +157,35 @@ class SemanticRouter:
                 entities={"temporal_reference": temporal},
                 candidate_tools=["memory_store_user_fact", "memory_store_summary"],
                 confidence=0.73,
+            )
+
+        if REMINDER_HINT_RE.search(message_clean):
+            has_reminder_action = bool(REMINDER_ACTION_HINT_RE.search(message_clean))
+            is_reminder_query = bool(REMINDER_QUERY_HINT_RE.search(message_clean))
+            if not has_reminder_action and not is_reminder_query:
+                return RouteDecision(
+                    intent="general_chat",
+                    entities={"temporal_reference": temporal},
+                    candidate_tools=["chat_general"],
+                    confidence=0.58,
+                )
+
+            reminder_confidence = 0.80
+            # "Recuérdame..." sin referencia temporal ni objeto explícito puede ser ambiguo:
+            # nota para memoria vs. alarma con fecha.
+            if not temporal and not REMINDER_EXPLICIT_HINT_RE.search(message_clean):
+                reminder_confidence = 0.60
+            return RouteDecision(
+                intent="reminder_management",
+                entities={"temporal_reference": temporal},
+                candidate_tools=[
+                    "reminder_create",
+                    "reminder_list",
+                    "reminder_delete",
+                    "reminder_update",
+                    "reminder_postpone",
+                ],
+                confidence=reminder_confidence,
             )
 
         extracted_query = extract_search_intent(message_clean)
@@ -240,8 +279,23 @@ class SemanticRouter:
             "memory_forget": "memory_delete",
             "memory_wipe": "memory_purge",
             "memory_reset": "memory_purge",
+            "reminder_create": "reminder_management",
+            "reminder_delete": "reminder_management",
+            "reminder_update": "reminder_management",
+            "reminder_postpone": "reminder_management",
+            "reminder_list": "reminder_management",
         }
         decision.intent = intent_alias.get(decision.intent, decision.intent)
+        if decision.intent == "reminder_management":
+            has_reminder_action = bool(REMINDER_ACTION_HINT_RE.search(message or ""))
+            is_reminder_query = bool(REMINDER_QUERY_HINT_RE.search(message or ""))
+            if not has_reminder_action and not is_reminder_query:
+                decision.intent = "general_chat"
+                decision.candidate_tools = ["chat_general"]
+                decision.needs_clarification = False
+                decision.clarification_question = ""
+                if decision.confidence > 0.58:
+                    decision.confidence = 0.58
 
         allowed_tools = set(self.capability_registry.all_ids())
         filtered = [tool_id for tool_id in decision.candidate_tools if tool_id in allowed_tools]
@@ -277,6 +331,17 @@ class SemanticRouter:
         elif decision.intent == "memory_purge":
             if "memory_purge_all" in allowed_tools and "memory_purge_all" not in filtered:
                 filtered.insert(0, "memory_purge_all")
+        elif decision.intent == "reminder_management":
+            reminder_tools = [
+                "reminder_create",
+                "reminder_list",
+                "reminder_delete",
+                "reminder_update",
+                "reminder_postpone",
+            ]
+            for reminder_tool in reminder_tools:
+                if reminder_tool in allowed_tools and reminder_tool not in filtered:
+                    filtered.append(reminder_tool)
 
         decision.candidate_tools = self.product_scope.filter_allowed(filtered)
         if not decision.candidate_tools:

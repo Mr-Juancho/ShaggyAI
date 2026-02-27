@@ -183,6 +183,33 @@ class MemoryManager:
                 break
         return matches
 
+    def _has_meaningful_delete_query(self, query: str) -> bool:
+        """Evita borrados con consultas demasiado genéricas/ambiguas."""
+        norm_query = self._normalize_text_key(query)
+        tokens = [token for token in norm_query.split() if len(token) >= 3]
+        if not tokens:
+            return False
+
+        generic = {
+            "memoria",
+            "recuerdo",
+            "recuerdos",
+            "dato",
+            "datos",
+            "perfil",
+            "conversacion",
+            "conversaciones",
+            "anterior",
+            "anteriores",
+            "borrar",
+            "eliminar",
+            "olvidar",
+            "quitar",
+            "remover",
+        }
+        meaningful = [token for token in tokens if token not in generic]
+        return bool(meaningful)
+
     def _filter_entries_for_user(
         self,
         entries: list[dict[str, Any]],
@@ -290,51 +317,180 @@ class MemoryManager:
             logger.error(f"Error al buscar entradas de perfil: {e}")
             return []
 
+    async def list_conversation_entries(
+        self,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        """Lista entradas crudas de conversaciones con IDs para borrado/edición."""
+        try:
+            if self.conversations.count() == 0:
+                return []
+
+            payload = self.conversations.get(
+                limit=max(1, min(limit, 2000)),
+                include=["documents", "metadatas"],
+            )
+            ids = payload.get("ids", []) or []
+            documents = payload.get("documents", []) or []
+            metadatas = payload.get("metadatas", []) or []
+
+            rows: list[dict[str, Any]] = []
+            for idx, doc_id in enumerate(ids):
+                rows.append(
+                    {
+                        "id": doc_id,
+                        "document": documents[idx] if idx < len(documents) else "",
+                        "metadata": self._safe_metadata(
+                            metadatas[idx] if idx < len(metadatas) else {}
+                        ),
+                    }
+                )
+            return rows
+        except Exception as e:
+            logger.error(f"Error al listar conversaciones de memoria: {e}")
+            return []
+
+    async def search_conversation_entries(
+        self,
+        query: str,
+        n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Busca entradas de conversaciones por similitud semántica."""
+        try:
+            total = self.conversations.count()
+            if total == 0:
+                return []
+
+            result = self.conversations.query(
+                query_texts=[query],
+                n_results=max(1, min(n, total)),
+                include=["documents", "distances", "metadatas"],
+            )
+            ids = (result.get("ids") or [[]])[0]
+            documents = (result.get("documents") or [[]])[0]
+            distances = (result.get("distances") or [[]])[0]
+            metadatas = (result.get("metadatas") or [[]])[0]
+
+            rows: list[dict[str, Any]] = []
+            for idx, doc_id in enumerate(ids):
+                distance = distances[idx] if idx < len(distances) else None
+                rows.append(
+                    {
+                        "id": doc_id,
+                        "document": documents[idx] if idx < len(documents) else "",
+                        "distance": float(distance) if isinstance(distance, (int, float)) else None,
+                        "metadata": self._safe_metadata(
+                            metadatas[idx] if idx < len(metadatas) else {}
+                        ),
+                    }
+                )
+
+            rows.sort(key=lambda item: item.get("distance", 99.0))
+            return rows
+        except Exception as e:
+            logger.error(f"Error al buscar entradas de conversaciones: {e}")
+            return []
+
     async def delete_user_facts_by_query(
         self,
         query: str,
         user_id: Optional[str] = None,
         max_items: int = 3,
         max_distance: float = 0.32,
+        allow_semantic_fallback: bool = False,
     ) -> dict[str, Any]:
         """
-        Elimina recuerdos del perfil por query semántica/lexical.
-        Prioriza coincidencia textual y usa embeddings como fallback.
+        Elimina recuerdos por query lexical (y opcionalmente semántica) en:
+        - perfil del usuario
+        - resúmenes de conversaciones
         """
         query_clean = str(query or "").strip()
         if len(query_clean) < 2:
-            return {"deleted_count": 0, "deleted_documents": []}
-
-        entries = await self.list_user_profile_entries(limit=500)
-        entries = self._filter_entries_for_user(entries, user_id=user_id)
-        lexical = self._find_lexical_matches(entries, query=query_clean, max_items=max_items)
-
-        selected: list[dict[str, Any]] = list(lexical)
-        if not selected:
-            candidates = await self.search_user_profile_entries(query_clean, n=max_items * 4)
-            candidates = self._filter_entries_for_user(candidates, user_id=user_id)
-            for item in candidates:
-                distance = item.get("distance")
-                if distance is None or distance > max_distance:
-                    continue
-                selected.append(item)
-                if len(selected) >= max_items:
-                    break
-
-        ids = [item["id"] for item in selected if item.get("id")]
-        if not ids:
-            return {"deleted_count": 0, "deleted_documents": []}
-
-        try:
-            self.user_profile.delete(ids=ids)
-            logger.info(f"Memoria eliminada por query='{query_clean}': {len(ids)} item(s)")
             return {
-                "deleted_count": len(ids),
-                "deleted_documents": [str(item.get("document", "")) for item in selected],
+                "deleted_count": 0,
+                "deleted_documents": [],
+                "profile_deleted": 0,
+                "conversations_deleted": 0,
             }
-        except Exception as e:
-            logger.error(f"Error al eliminar memorias por query: {e}")
-            return {"deleted_count": 0, "deleted_documents": []}
+        if not self._has_meaningful_delete_query(query_clean):
+            logger.info(f"Borrado de memoria omitido por query genérica: '{query_clean}'")
+            return {
+                "deleted_count": 0,
+                "deleted_documents": [],
+                "profile_deleted": 0,
+                "conversations_deleted": 0,
+            }
+
+        async def _select_for_collection(
+            list_fn: Any,
+            search_fn: Any,
+        ) -> list[dict[str, Any]]:
+            entries = await list_fn(limit=500)
+            entries = self._filter_entries_for_user(entries, user_id=user_id)
+            lexical = self._find_lexical_matches(entries, query=query_clean, max_items=max_items)
+            selected: list[dict[str, Any]] = list(lexical)
+            if selected:
+                return selected
+
+            if allow_semantic_fallback:
+                candidates = await search_fn(query_clean, n=max_items * 4)
+                candidates = self._filter_entries_for_user(candidates, user_id=user_id)
+                for item in candidates:
+                    distance = item.get("distance")
+                    if distance is None or distance > max_distance:
+                        continue
+                    selected.append(item)
+                    if len(selected) >= max_items:
+                        break
+            return selected
+
+        profile_selected = await _select_for_collection(
+            self.list_user_profile_entries,
+            self.search_user_profile_entries,
+        )
+        conv_selected = await _select_for_collection(
+            self.list_conversation_entries,
+            self.search_conversation_entries,
+        )
+
+        deleted_documents: list[str] = []
+        profile_deleted = 0
+        conversations_deleted = 0
+
+        profile_ids = [item["id"] for item in profile_selected if item.get("id")]
+        if profile_ids:
+            try:
+                self.user_profile.delete(ids=profile_ids)
+                profile_deleted = len(profile_ids)
+                deleted_documents.extend(str(item.get("document", "")) for item in profile_selected)
+            except Exception as e:
+                logger.error(f"Error al eliminar recuerdos de perfil por query: {e}")
+
+        conv_ids = [item["id"] for item in conv_selected if item.get("id")]
+        if conv_ids:
+            try:
+                self.conversations.delete(ids=conv_ids)
+                conversations_deleted = len(conv_ids)
+                deleted_documents.extend(str(item.get("document", "")) for item in conv_selected)
+            except Exception as e:
+                logger.error(f"Error al eliminar recuerdos de conversaciones por query: {e}")
+
+        deleted_total = profile_deleted + conversations_deleted
+        if deleted_total:
+            logger.info(
+                "Memoria eliminada por query='%s': total=%s perfil=%s conversaciones=%s",
+                query_clean,
+                deleted_total,
+                profile_deleted,
+                conversations_deleted,
+            )
+
+        return {
+            "deleted_count": deleted_total,
+            "deleted_documents": deleted_documents,
+            "profile_deleted": profile_deleted,
+            "conversations_deleted": conversations_deleted,
+        }
 
     async def update_user_fact(
         self,
